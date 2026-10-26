@@ -166,8 +166,17 @@ rows, the user already owns a unit — you must **not** run the decrement.
 
 **Acceptance criteria.**
 - `INVENTORY_DRIVER=postgres npm test` is green — same tests as memory.
-- A duplicate purchase leaves `remaining_stock` unchanged (assert this
-  explicitly; it is R4).
+- **A duplicate purchase never decrements inventory.** Assert it directly:
+  read `remaining_stock`, have an existing buyer purchase again, read it back
+  — identical, and `purchases` gained no row. The duplicate branch must return
+  *before* the `UPDATE` runs, not compensate for it afterwards.
+- **If the INSERT succeeds but inventory allocation fails, the whole
+  transaction rolls back.** When the decrement returns zero rows — sold out,
+  outside the window, or any error between the two statements — the inserted
+  `purchases` row must not survive. An orphan row would permanently bar that
+  user from a unit they never received. Test it: set `remaining_stock` to 0,
+  attempt a purchase as a user who has never bought, then confirm
+  `SELECT count(*) FROM purchases WHERE user_id = …` is 0.
 - Two API instances against one database still sell exactly 10. **This is the
   experiment the memory driver cannot pass — it is the one to show off.**
 - The database being unreachable produces a 503, never a sale. Fail closed;
@@ -200,6 +209,20 @@ classifying `SELECT`), then `packages/web/.env` or the URL to leave mock mode.
 - `?api=live` renders the same screens the mock scenarios do.
 - The mock adapter still works untouched — it is a preview tool, not a
   fallback, and must never silently substitute for a broken backend.
+- **During uncertainty recovery, an empty lookup must not immediately imply
+  failure.** When a purchase fails in transit, the original request may still
+  be committing on the server. A `hasPurchased: false` read taken a moment
+  later proves nothing — telling the user "nothing was reserved, try again" on
+  the strength of it can hand one person two units, or make them retry into
+  their own in-flight transaction. Treat the first empty read as *still
+  unknown*: re-check a few times with backoff, and only conclude "not
+  reserved" once the window in which the original request could still be
+  in flight has passed (its timeout plus the server's `statement_timeout`).
+  Until then the honest answer is "still checking".
+
+  *Known gap:* `checkMyOrder` in `packages/web/src/App.tsx` currently takes the
+  optimistic shortcut — one read, and an empty result is reported as "nothing
+  was reserved". That is the naive version this criterion replaces.
 
 **Verify.**
 ```bash
