@@ -1,54 +1,64 @@
 import type { Order } from '@flash/shared';
+import { NotImplementedError } from '../errors.ts';
 import type { InventoryStore, ReservationResult } from './inventoryStore.ts';
 
 /**
  * ============================================================================
- *  GUIDE.md step 3a -- the durable-by-default driver. Write it yourself.
+ *  GUIDE.md step 4 -- the recommended implementation path. Write it yourself.
  * ============================================================================
  *
- * One system instead of three: the reservation and the business record are the
- * same committed transaction, so there is no queue, no worker, and no window
- * where a user holds a unit that nothing durable knows about. For a ten-unit
- * sale that is very likely the right engineering answer, and saying so is
- * worth more than reaching for Redis reflexively.
+ * Schema lives in `packages/server/db/schema.sql` (proposed, not yet applied).
  *
- * Schema -- the unique index is not an optimisation, it is the second,
- * independent guarantee of one-per-user, enforced by storage rather than by
- * application logic:
+ * ---------------------------------------------------------------------------
+ *  THE FOUR TRANSACTION REQUIREMENTS
+ *  Every one of these must hold under concurrent load. They are the acceptance
+ *  criteria for this file, and the test checklist in the README mirrors them.
+ * ---------------------------------------------------------------------------
  *
- *   CREATE TABLE sales (
- *     id              int PRIMARY KEY,
- *     remaining_stock int         NOT NULL CHECK (remaining_stock >= 0),
- *     starts_at       timestamptz NOT NULL,
- *     ends_at         timestamptz NOT NULL
- *   );
+ *  R1. THE SALE WINDOW IS ENFORCED ON THE SERVER.
+ *      A purchase outside [starts_at, ends_at) must be refused regardless of
+ *      what the client believes. Put the check in the SQL predicate, using
+ *      clock_timestamp() rather than now(): now() is transaction-START time,
+ *      and this statement may have spent time blocked on the row lock.
+ *      Checking it in SQL also judges the window by ONE clock however many API
+ *      nodes exist -- strictly better than the per-node check the skeleton
+ *      currently does in flashSale.ts.
  *
- *   CREATE TABLE purchases (
- *     order_id   uuid PRIMARY KEY,
- *     sale_id    int         NOT NULL REFERENCES sales(id),
- *     user_id    text        NOT NULL,
- *     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
- *     UNIQUE (sale_id, user_id)
- *   );
+ *  R2. STOCK CAN NEVER GO NEGATIVE.
+ *      Two defences, both required. The predicate `remaining_stock > 0` in the
+ *      UPDATE, and `CHECK (remaining_stock >= 0)` on the column. The predicate
+ *      is the mechanism; the CHECK is the proof that a future bug cannot
+ *      quietly oversell.
  *
- * The transaction, in this order. Inserting BEFORE the contended UPDATE is
- * deliberate: it shortens the time this transaction holds the exclusive lock
- * on the single `sales` row, which is the one thing every buyer queues behind.
+ *  R3. ONE PURCHASE PER USER, ENFORCED BY THE DATABASE.
+ *      UNIQUE (sale_id, user_id) on `purchases`. Not a uniqueness check in
+ *      application code -- a constraint, so it holds even if the reservation
+ *      logic has a race.
+ *
+ *  R4. A FAILED OR DUPLICATE PURCHASE MUST NEVER CONSUME STOCK.
+ *      This is the one most often got wrong. If the INSERT reports a duplicate,
+ *      you must NOT run the decrement: return early and ROLLBACK. If the
+ *      decrement reports zero rows, the INSERT must not survive. Either both
+ *      effects happen or neither does -- that is what the transaction is for.
+ *
+ * ---------------------------------------------------------------------------
+ *  THE TRANSACTION
+ * ---------------------------------------------------------------------------
  *
  *   BEGIN;
  *
  *   -- ON CONFLICT rather than catching 23505: a unique violation aborts the
- *   -- whole transaction, so you could not then look up the original order to
- *   -- return it. Zero rows here means "already bought", with the transaction
- *   -- still alive.
+ *   -- WHOLE transaction, so you could not then look up the original order to
+ *   -- return it. Zero rows here means "already bought", transaction still
+ *   -- alive -- and per R4 you must stop here, before the decrement.
  *   INSERT INTO purchases (order_id, sale_id, user_id)
  *   VALUES ($1, $2, $3)
  *   ON CONFLICT (sale_id, user_id) DO NOTHING
  *   RETURNING order_id, created_at;
  *
- *   -- clock_timestamp(), not now(): now() is transaction-START time, and this
- *   -- statement may have spent time blocked on the row lock. It also means the
- *   -- window is judged by ONE clock, however many API nodes there are.
+ *   -- Only if the INSERT returned a row. Inserting BEFORE this contended
+ *   -- UPDATE is deliberate: it shortens the time this transaction holds the
+ *   -- exclusive lock on the single `sales` row, which every buyer queues on.
  *   UPDATE sales
  *      SET remaining_stock = remaining_stock - 1
  *    WHERE id = $2
@@ -60,18 +70,22 @@ import type { InventoryStore, ReservationResult } from './inventoryStore.ts';
  *   COMMIT;   -- or ROLLBACK if either step came back empty
  *
  * Why that UPDATE cannot oversell, which is the part worth being able to
- * explain: under READ COMMITTED a blocked UPDATE re-evaluates its WHERE clause
- * against the row version written by the transaction it waited for
- * (EvalPlanQual). So `remaining_stock > 0` is tested AFTER the wait, not
+ * explain out loud: under READ COMMITTED a blocked UPDATE re-evaluates its
+ * WHERE clause against the row version written by the transaction it waited
+ * for (EvalPlanQual). So `remaining_stock > 0` is tested AFTER the wait, not
  * before. Under REPEATABLE READ or SERIALIZABLE the same statement raises a
- * 40001 serialization failure instead, and you need a bounded retry loop --
+ * 40001 serialization failure instead and you need a bounded retry loop --
  * know which isolation level your driver opens transactions with.
  *
- * Things the reviewer will look for, in rough order of importance:
+ * ---------------------------------------------------------------------------
+ *  THEN THE PARTS A REVIEWER WILL PROBE
+ * ---------------------------------------------------------------------------
+ *
  *   1. A zero-row UPDATE cannot tell you WHY it failed. Sold out, not started
  *      and already ended are three different screens in the UI, so classify
- *      with a follow-up SELECT on the sales row before you roll back. Mapping
- *      all three onto one "unavailable" is the most common hole in this design.
+ *      with a SELECT on the sales row before you roll back. Collapsing all
+ *      three into one "unavailable" is the most common hole in this design,
+ *      and `ReservationResult` is typed to stop you doing it.
  *   2. The bottleneck is the connection pool, not the row lock. Thousands of
  *      concurrent buyers against a pool of tens means requests queue inside
  *      the API: latency climbs, timeouts cascade, and the API falls over while
@@ -80,9 +94,12 @@ import type { InventoryStore, ReservationResult } from './inventoryStore.ts';
  *      (transaction mode) in front.
  *   3. Short-circuit the losers. Once stock is zero, a cached flag lets the
  *      other 99% of requests be answered without opening a transaction at all.
- *      This is the cheapest large win available to this driver.
+ *      The cheapest large win available to this driver.
  *   4. `init` must not refill the shelf on a deploy mid-sale: seed with
- *      INSERT ... ON CONFLICT (id) DO NOTHING.
+ *      INSERT ... ON CONFLICT (id) DO NOTHING, as schema.sql does.
+ *   5. If the database is unreachable: FAIL CLOSED. 503, no sale, client
+ *      retries. Never fall back to the memory driver -- that is how you
+ *      oversell during an incident.
  */
 export class PostgresInventoryStore implements InventoryStore {
   constructor(
@@ -91,19 +108,19 @@ export class PostgresInventoryStore implements InventoryStore {
   ) {}
 
   async init(_totalStock: number): Promise<void> {
-    throw new Error('PostgresInventoryStore is not implemented yet -- see GUIDE.md step 3a');
+    throw new NotImplementedError('PostgresInventoryStore.init()', 'step 4');
   }
 
   async reserve(_userId: string, _orderId: string, _at: Date): Promise<ReservationResult> {
-    throw new Error('PostgresInventoryStore is not implemented yet -- see GUIDE.md step 3a');
+    throw new NotImplementedError('PostgresInventoryStore.reserve()', 'step 4');
   }
 
   async findOrder(_userId: string): Promise<Order | null> {
-    throw new Error('PostgresInventoryStore is not implemented yet -- see GUIDE.md step 3a');
+    throw new NotImplementedError('PostgresInventoryStore.findOrder()', 'step 4');
   }
 
   async remaining(): Promise<number> {
-    throw new Error('PostgresInventoryStore is not implemented yet -- see GUIDE.md step 3a');
+    throw new NotImplementedError('PostgresInventoryStore.remaining()', 'step 4');
   }
 
   async close(): Promise<void> {

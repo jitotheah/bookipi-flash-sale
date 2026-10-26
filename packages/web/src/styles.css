@@ -517,3 +517,63 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---- mock adapter banner ------------------------------------------------ */
+
+.mockbar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 11px 14px;
+  border: 1px dashed #c08a1e;
+  border-radius: 12px;
+  background: repeating-linear-gradient(
+    135deg,
+    #fff8e8,
+    #fff8e8 10px,
+    #fdf3dc 10px,
+    #fdf3dc 20px
+  );
+  color: #7a5408;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.mockbar strong {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+}
+
+.mockbar code,
+.state-copy code,
+.fineprint code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: rgba(15, 23, 42, 0.07);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.92em;
+}
+
+/* ---- demo identity disclaimer ------------------------------------------- */
+
+.disclaimer {
+  margin: 0 0 18px;
+  padding: 12px 14px;
+  border-left: 3px solid var(--warn);
+  border-radius: 0 10px 10px 0;
+  background: #fffaf0;
+  color: #7c5a16;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.disclaimer strong {
+  display: block;
+  margin-bottom: 3px;
+  color: #6b4a0c;
+}
+
+/* The uncertainty card leads with its action, so the CTA sits closer. */
+.card--state .cta {
+  margin-top: 18px;
+}

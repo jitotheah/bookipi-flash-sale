@@ -8,10 +8,14 @@ thousands of people press *Buy Now* in the same second, and exactly ten of them
 may win. This repo is structured so that the concurrency decision is a single,
 reviewable seam rather than something smeared across the codebase.
 
-> **Status: skeleton.** The in-memory path is complete, tested and passing a
-> load test. The two production drivers (Postgres, Redis) and the surrounding
-> concerns (durable persistence, caching, rate limiting) are stubbed with the
-> contracts they must satisfy. See [`GUIDE.md`](./GUIDE.md) for the build order.
+> **Status: UI + scaffolding complete. Backend transaction not implemented.**
+>
+> The React storefront, the typed API contract, the route skeletons, the store
+> interface and the proposed schema are done. `PostgresInventoryStore` is a
+> documented stub — writing it is the exercise. Unimplemented operations
+> report themselves as `501 not_implemented` rather than failing silently.
+>
+> [`GUIDE.md`](./GUIDE.md) teaches it one step at a time.
 
 ---
 
@@ -49,28 +53,35 @@ reviewable seam rather than something smeared across the codebase.
                       ║   2. is stock > 0?           ║
                       ║   3. decrement + record      ║
                       ║                              ║
-                      ║  pluggable — see below:      ║
-                      ║   · Postgres transaction     ║
-                      ║   · Redis Lua script         ║
+                      ║  InventoryStore interface    ║
+                      ║  [built] memory (reference)  ║
+                      ║  [PLANNED] Postgres  ◄── you ║
                       ╚══════════════┬═══════════════╝
                                      │
-            ┌────────────────────────┴────────────────────────┐
-            │                                                 │
-    ╌╌ Postgres driver ╌╌                            ╌╌ Redis driver ╌╌
-    The transaction IS the                     The reservation is acknowledged
-    durable business record.                   by Redis; the durable record is
-    Nothing downstream.                        written off the hot path:
-                                                               │
-                                                               ▼
-                                               ┌──────────────────────────┐
-                                               │ Queue (Redis Stream/SQS) │
-                                               └────────────┬─────────────┘
-                                                            ▼
-                                               ┌──────────────────────────┐
-                                               │ Worker ──► PostgreSQL    │
-                                               │ + reconciliation job     │
-                                               └──────────────────────────┘
+                                     ▼
+                      ┌──────────────────────────────┐
+                      │  PostgreSQL     [PLANNED]    │
+                      │  sales(remaining_stock, …)   │
+                      │  purchases UNIQUE(sale,user) │
+                      │                              │
+                      │  The transaction IS the      │
+                      │  durable business record —   │
+                      │  nothing downstream of it.   │
+                      └──────────────────────────────┘
+
+
+        ╌╌ optional extension, only if measurement justifies it ╌╌
+
+        Redis Lua script in place of the transaction, with the durable
+        record written off the hot path:
+            Redis ──► queue (Stream/SQS) ──► worker ──► PostgreSQL
+                                                     + reconciliation job
+        Buys ~100k ops/s and no pool to exhaust. Costs durability,
+        a worker, and a reconciliation job the Postgres path never needs.
 ```
+
+**Legend.** `[built]` ships in this repo. `[PLANNED]` is scaffolded with its
+contract written down and reports `501` until you implement it.
 
 ### Why this shape
 
@@ -87,15 +98,14 @@ This is true for every driver below.
 
 ---
 
-## 2. Choosing the serialisation point
+## 2. Why PostgreSQL
 
 `src/store/inventoryStore.ts` defines one contract — *the dedupe check, the
-stock check and the decrement are one indivisible step* — and three drivers
-satisfy it. Picking between them is the central engineering judgement in this
-project, so both candidates are stated fairly rather than one being set up to
-lose.
+stock check and the decrement are one indivisible step*. PostgreSQL is the
+recommended implementation of it; Redis is an optional extension, documented
+here so the trade-off is argued rather than assumed.
 
-### Postgres: one system, durable, correct
+### The recommended path: one Postgres transaction
 
 ```sql
 BEGIN;
@@ -134,14 +144,16 @@ there healthy. Mitigate with PgBouncer in transaction mode, short transactions,
 `lock_timeout` / `statement_timeout` so waiters fail fast, and a cached
 sold-out flag so the ~99% of losers never open a transaction at all.
 
-### Redis: highest throughput, durability bolted back on
+### The optional extension: Redis
 
-A Lua script runs to completion with nothing interleaved, giving the same
-guarantee at ~100k ops/s with one network round trip, and removing the row-lock
-queue entirely. The price: Redis is not durable by default, so the business
-record moves to an async worker and you now owe a reconciliation job, an AOF
-policy, and a cold-start rule that rebuilds stock from Postgres rather than
-re-seeding (otherwise a restart refills the shelf and you oversell).
+Not required, and not a second backend to implement — `redisStore.ts` is a
+sketch kept for the comparison. A Lua script runs to completion with nothing
+interleaved, giving the same guarantee at ~100k ops/s with one network round
+trip and no connection pool to exhaust. The price: Redis is not durable by
+default, so the business record moves to an async worker and you now owe a
+reconciliation job, an AOF policy, and a cold-start rule that rebuilds stock
+from Postgres rather than re-seeding (otherwise a restart refills the shelf and
+you oversell). Worth building only to *measure* the difference.
 
 ### The honest verdict
 
@@ -149,71 +161,172 @@ For **10 units and a one-hour window, Postgres alone is the right answer** —
 one system, one source of truth, no eventual consistency to explain, and the
 unique index is an independent guarantee of one-per-user that no application
 bug can defeat. Redis earns its place when sustained write throughput on the
-contended row becomes the limit, not before. Reaching for it at this scale is
+contended row becomes the limit, not before; reaching for it at this scale is
 the kind of unjustified complexity the brief calls out.
 
-Both are kept behind the same interface so the choice is a config change and
-the same contract tests run against either — which turns the trade-off from an
-assertion into a measurement.
+Both sit behind the same interface, so if you do build the extension the choice
+is a config change and the same contract tests run against either — which turns
+the trade-off from an assertion into a measurement.
 
 ### Trade-offs taken deliberately
 
 | Decision | Bought | Paid |
 |---|---|---|
 | One pluggable serialisation point | Concurrency lives in one reviewable file; drivers are swappable | A layer of indirection over "just call the DB" |
-| Postgres as the default driver | Durable, one system, no reconciliation | Throughput capped by row-lock + pool; needs load shedding |
-| Redis as the scale-out driver | O(1) reservation, ~100k ops/s | Needs AOF, replica, worker and reconciliation to be durable |
-| Async persistence (Redis path only) | Purchase latency independent of the DB | Eventual consistency; a drain-lag window |
+| Postgres as the recommended driver | Durable, one system, no reconciliation | Throughput capped by pool then row-lock; needs load shedding |
+| Redis left as an optional extension | No unjustified complexity for 10 units | Row-lock ceiling stays until someone measures it |
+| Memory driver kept as a reference | Executable definition of correct; tests run with nothing installed | One more driver to explain; must never be a production fallback |
+| Mock adapter in the frontend | UI reviewable with no backend at all | Must be labelled on screen or it becomes a lie |
 | Time window checked in the API | Pre-sale flood rejected without an inventory round-trip | N nodes means N clocks; the Postgres driver fixes this with `clock_timestamp()` |
 | `remainingStock` exposed in the sale response | Honest, motivating UI | Cache-busting if served uncached; it is advisory only |
 | User identifier typed by the shopper | Matches the brief, demoable | Trivially bypassed — production must key on an authenticated account |
 
-## 3. What is built, what is not
+## 3. Implemented vs planned
 
-| Area | State |
+Everything marked **planned** is scaffolded with its contract written down and
+nothing faked: a stub reports `501 not_implemented`, it does not return a
+plausible-looking answer.
+
+### Implemented
+
+| | |
 |---|---|
-| React storefront (login → product → processing → confirmed / sold out / already bought) | **Done** |
-| `GET /api/sale`, `POST /api/purchase`, `GET /api/purchase/:userId`, `/health` | **Done** |
-| Sale window, one-per-user, limited stock, outcome → HTTP mapping | **Done** |
-| In-memory inventory driver + unit and integration tests (11 passing) | **Done** |
-| Load generator asserting *no oversell* and *one per user* | **Done** |
-| Postgres driver (transaction + unique index) | **Stub** — GUIDE.md step 3a |
-| Redis driver (the Lua script) | **Stub** — GUIDE.md step 3b |
-| Durable persistence + queue worker (Redis path only) | **Stub** — GUIDE.md step 4 |
-| Response caching, rate limiting | **Not started** — GUIDE.md step 5 |
-| Failure handling & reconciliation | **Not started** — GUIDE.md step 6 |
+| React storefront, all 8 UI states | sign-in, upcoming, active, purchasing, purchased, sold out, ended, uncertainty/error |
+| Mock adapter (labelled on screen) | lets the UI run and be reviewed with no backend at all |
+| Typed API contract | `packages/shared` — one breaking change fails typecheck on both sides |
+| Route skeletons | `GET /api/sale`, `POST /api/purchase`, `GET /api/purchase/:userId`, `/health` |
+| Domain rules | sale window, one-per-user, limited stock, outcome → HTTP mapping |
+| Store interface | `InventoryStore` — the single concurrency boundary |
+| Memory driver (**reference only**) | defines correct behaviour for the tests; not a deliverable |
+| 12 unit + integration tests | including a 500-caller oversell test and a 501 test |
+| Load generator | asserts no-oversell and one-per-user; a starting point, not a finished suite |
+| Proposed schema | `packages/server/db/schema.sql` — written, not yet applied by code |
+
+### Planned
+
+| | Where | Guide |
+|---|---|---|
+| **The purchase transaction** | `store/postgresStore.ts` | step 4 ⭐ |
+| Outcome classification (sold out vs. not started vs. ended) | same file | step 5 |
+| Response caching + rate limiting | `routes/sale.ts`, `app.ts` | step 6 |
+| Failure-mode write-up | `README.md` | step 7 |
+| Full stress-test suite (k6, remote generator, failure runs) | `stress/` | step 8 |
+| *Optional:* Redis driver, queue worker | `store/redisStore.ts`, `persistence/` | optional |
 
 ---
 
-## 4. Running it
+## 4. The four transaction requirements
+
+These are the acceptance criteria for `postgresStore.ts`, and the test
+checklist below mirrors them one for one.
+
+| | Requirement | Enforced by |
+|---|---|---|
+| **R1** | The sale window is enforced **on the server** | `clock_timestamp() >= starts_at AND < ends_at` inside the `UPDATE` predicate — not `now()` (transaction-start time), and not the client |
+| **R2** | Stock can **never** go negative | `remaining_stock > 0` in the predicate **and** `CHECK (remaining_stock >= 0)` on the column — mechanism plus proof |
+| **R3** | One purchase per user | `UNIQUE (sale_id, user_id)` — a constraint, so it holds even if the reservation logic has a race |
+| **R4** | A failed or duplicate purchase **never consumes stock** | On duplicate, stop before the decrement; on refusal, `ROLLBACK` so neither the insert nor the decrement survives |
+
+R4 is the one most often got wrong. The `INSERT … ON CONFLICT DO NOTHING`
+returning zero rows means the user already owns a unit — the decrement must not
+run at all.
+
+Why the conditional `UPDATE` cannot oversell: under `READ COMMITTED` a blocked
+`UPDATE` re-evaluates its `WHERE` clause against the row version written by the
+transaction it waited for (EvalPlanQual), so `remaining_stock > 0` is tested
+*after* the wait. Under `REPEATABLE READ` it raises `40001` instead and needs a
+bounded retry loop.
+
+---
+
+## 5. Test checklist
+
+Implemented tests are ticked. The rest are what "done" looks like.
+
+**Concurrency — the invariants (R2, R3, R4)**
+- [x] 500 concurrent buyers against 10 units → exactly 10 winners
+- [x] 50 concurrent attempts from one user → 1 winner, stock down by 1
+- [ ] Same two tests against Postgres, via a shared contract-test function
+- [ ] A duplicate purchase leaves `remaining_stock` unchanged (R4)
+- [ ] A rolled-back transaction leaves no orphan `purchases` row (R4)
+- [ ] Two API instances, one database → still exactly 10
+
+**Sale window (R1)**
+- [x] Purchase before `starts_at` → `sale_not_started`, stock untouched
+- [x] Purchase after `ends_at` → `sale_ended`, stock untouched
+- [ ] The window is judged by the database clock, not the API node's
+- [ ] A request arriving one millisecond past `ends_at`
+
+**API surface**
+- [x] `201` first purchase, `200` repeat, `409` sold out, `400` bad identifier
+- [x] Stub drivers answer `501 not_implemented` and still boot
+- [x] `GET /api/purchase/:userId` reports held units
+- [ ] `503` when the database is unreachable — fail closed, never a sale
+
+**Load**
+- [x] Invariants hold with every request in flight at once
+- [ ] Generator on separate hardware from the API
+- [ ] Degradation point identified and named (expect pool saturation)
+- [ ] An instance killed mid-run; invariants still hold
+
+---
+
+## 6. Running it
+
+### The UI alone — no backend required
 
 ```bash
 npm install
-
-# API on :3000, web on :5173 (Vite proxies /api to the API)
-npm run dev:server
-npm run dev:web            # in a second terminal
+npm run dev:web        # http://localhost:5173
 ```
 
-Open http://localhost:5173, sign in with any identifier, press **Buy Now**.
-Open a second browser profile to watch stock drop for everyone.
+The frontend defaults to a **mock adapter**: simulated data, in your browser
+tab, nothing persisted. A labelled banner says so on every screen — simulated
+data must never be mistakable for real data.
 
-Configuration (see `.env.example`): `TOTAL_STOCK` (default 10), `SALE_START_AT`
-/ `SALE_END_AT` (default: starts at boot, runs one hour), `INVENTORY_DRIVER`,
-`PORT`, `LOG_LEVEL`.
+Every UI state is reachable with `?mock=<scenario>`:
+
+| Scenario | Shows |
+|---|---|
+| `active` *(default)* | open sale, 10 units |
+| `upcoming` | starts in two minutes, countdown running |
+| `ended` | closed an hour ago |
+| `sold_out` | open, zero stock |
+| `last_one` | one unit left — race two tabs against it |
+| `slow` | 2.5s purchases, to sit in the purchasing state |
+| `uncertain` | transport failure, outcome unknown → "Check my order" |
+| `unimplemented` | what a `501` stub driver looks like |
+
+```
+http://localhost:5173/?mock=sold_out
+```
+
+### Against the real API
 
 ```bash
-# a sale that has not opened yet
-SALE_START_AT=2027-01-01T00:00:00Z npm run dev:server
+npm run dev:server                              # :3000, memory driver
+open 'http://localhost:5173/?api=live'          # or VITE_API_MODE=live
+```
 
-# a sale with one unit, to see "sold out" immediately
-TOTAL_STOCK=1 npm run dev:server
+The memory driver is a **reference implementation for the tests**, not a
+deliverable — it cannot survive a restart or more than one process. Point the
+UI at `INVENTORY_DRIVER=postgres` once you have written step 4; until then it
+answers `501` and the UI says which step is missing.
+
+Configuration (see `.env.example`): `TOTAL_STOCK` (default 10), `SALE_START_AT`
+/ `SALE_END_AT` (default: starts at boot, runs one hour), `INVENTORY_DRIVER`
+(`memory` | `postgres` | `redis`), `DATABASE_URL`, `PORT`, `LOG_LEVEL`.
+
+```bash
+SALE_START_AT=2027-01-01T00:00:00Z npm run dev:server   # a sale not yet open
+TOTAL_STOCK=1 npm run dev:server                        # sold out after one
+INVENTORY_DRIVER=postgres npm run dev:server            # boots, answers 501
 ```
 
 ### Tests
 
 ```bash
-npm test          # vitest: 11 unit + integration tests
+npm test          # vitest: 12 unit + integration tests
 npm run typecheck # tsc across all three packages
 ```
 
@@ -252,11 +365,17 @@ Reading the numbers honestly: the latency above is dominated by the load
 generator and the API sharing one machine, and 1.8k req/s is the *client's*
 ceiling here, not the server's. The number that matters is that the invariants
 held while every request was in flight at once. Measuring the server's real
-ceiling needs the generator on separate hardware — see GUIDE.md step 7.
+ceiling needs the generator on separate hardware — GUIDE.md step 8, which also
+covers the ramping profile, the failure run and the results table this section
+still owes.
+
+Note what this run does *not* prove: it exercises the memory driver, which is
+one process. The interesting version is the same script against two API
+instances sharing one Postgres — that is step 4's acceptance criterion.
 
 ---
 
-## 5. API
+## 7. API
 
 | Method | Path | Returns |
 |---|---|---|
@@ -269,22 +388,42 @@ ceiling needs the generator on separate hardware — see GUIDE.md step 7.
 retry is a successful idempotent replay, not an error. `serverTime` lets the
 browser run its countdown off the server's clock rather than the laptop's.
 
+Two failure codes are distinct on purpose: **`501 not_implemented`** means the
+driver behind that endpoint is still a stub, **`500`** means something broke.
+The UI renders them differently — "not written yet" and "crashed" are different
+facts. A stub never invents a plausible answer.
+
+A purchase that errors is a purchase the server did not commit, so a retry is
+safe. But the *client* cannot tell a dropped connection from a lost response,
+so the UI never claims it was not charged: it moves to an uncertainty state and
+resolves it with `GET /api/purchase/:userId`, which is authoritative and free
+to call.
+
 ---
 
-## 6. Layout
+## 8. Layout
 
 ```
 packages/shared   API contract shared by both sides — one breaking change
                   fails typecheck on the server AND the browser
 packages/server   Fastify API
   src/config.ts        all env parsing, in one place
+  src/errors.ts        NotImplementedError → 501
   src/domain/          business rules, no HTTP
   src/store/           ◄── the concurrency boundary
-                       (memory | postgres | redis)
+    inventoryStore.ts    the contract
+    memoryStore.ts       reference implementation (tests only)
+    postgresStore.ts     ◄── PLANNED: you write this
+    redisStore.ts        optional extension, sketch only
   src/routes/          outcome → status code
-  src/persistence/     durable-write hook
+  src/persistence/     durable-write hook (Redis path only)
+  db/schema.sql        proposed schema — not yet applied by code
   test/                unit + integration
 packages/web      React storefront
+  src/lib/api.ts       adapter switch (mock | live)
+  src/lib/mockApi.ts   labelled simulation, for building the UI
+  src/lib/httpApi.ts   the real client
+  src/components/      one component per UI state
 stress/run.mjs    load generator with correctness assertions
 ```
 

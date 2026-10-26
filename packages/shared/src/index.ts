@@ -62,8 +62,14 @@ export interface PurchaseLookupResponse {
   order: Order | null;
 }
 
-/** Every non-2xx response the API produces uses this envelope. */
+/**
+ * Every non-2xx response the API produces uses this envelope.
+ *
+ * `not_implemented` (501) is distinct from `error` (500) on purpose: it means
+ * the operation is a stub that has not been written yet, which is a fact the
+ * UI can show honestly rather than reporting as a crash.
+ */
 export interface ApiError {
-  outcome: PurchaseOutcome | 'error';
+  outcome: PurchaseOutcome | 'error' | 'not_implemented';
   message: string;
 }

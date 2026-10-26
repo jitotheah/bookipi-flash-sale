@@ -1,62 +1,99 @@
-# Build order
+# Build guide
 
-The skeleton gives you a system that is already correct and already load-tested
-— on one process. Everything below turns that into something you can defend as
-a distributed design. Each step is independently demoable, so if you run out of
-time you stop at a working state rather than a half-finished one.
+One step at a time. Each has a **purpose**, the **files** it touches,
+**acceptance criteria** you can check, and a **verify** command.
 
-**Suggested budget: ~8 hours.** Steps 1, 2, 3a and 7 are the ones that get
-marked. Step 5 is cheap and shows systems thinking. Step 3b is the stretch
-goal: do it if you want to *measure* the Postgres-vs-Redis trade-off rather
-than assert it. Steps 4 and 6 can be partly written up instead of built, as
-long as you say so.
+The skeleton gives you a complete UI, a typed API contract, route skeletons, a
+store interface and a reference implementation that is already correct — on
+one process, in memory. Your job is the real backend: a Postgres transaction
+that holds the same invariants under concurrent load.
 
----
+**PostgreSQL is the recommended path.** Redis is an optional extension at the
+end, not a second backend you have to write.
 
-## Step 0 — Make it yours (30 min)
+Suggested budget ≈ 8 hours:
 
-Read these four files in order. They are the whole mental model:
-
-1. `packages/server/src/store/inventoryStore.ts` — the contract everything rests on
-2. `packages/server/src/store/memoryStore.ts` — the simplest thing that satisfies it
-3. `packages/server/src/domain/flashSale.ts` — the business rules
-4. `packages/server/test/flashSale.test.ts` — what "correct" means, executably
-
-Then run `npm test` and `npm run stress` so you have seen green before you
-change anything.
-
-Change the product, the copy, the stock — make it a repo you wrote. Reviewers
-notice when a candidate cannot explain a line of their own submission, and
-*that* is the real risk of starting from a skeleton.
+| Step | | Time |
+|---|---|---|
+| 0 | Orient | 30 min |
+| 1 | Prove the race exists | 30 min |
+| 2 | Write the failing contract tests | 30 min |
+| 3 | Apply the schema | 20 min |
+| 4 | **Implement the transaction** ⭐ | 2–3 h |
+| 5 | Classify outcomes, switch the UI to live | 45 min |
+| 6 | Shed the read load | 45 min |
+| 7 | Failure modes (writing) | 1 h |
+| 8 | Stress testing | 1–2 h |
+| 9 | Final write-up | 1 h |
+| — | Optional: Redis extension | 2 h |
 
 ---
 
-## Step 1 — Prove the race exists (30 min) ⭐ do not skip
+## Step 0 — Orient
 
-Before writing concurrency control, demonstrate the bug it prevents. In
-`memoryStore.ts`, split the critical section:
+**Purpose.** Understand the one abstraction the design rests on before
+changing anything. You cannot defend code you have not read, and starting from
+a skeleton only pays off if you own it by the end.
+
+**Files to read, in this order.**
+
+1. `packages/shared/src/index.ts` — the API contract both sides share
+2. `packages/server/src/store/inventoryStore.ts` — the concurrency boundary
+3. `packages/server/src/store/memoryStore.ts` — the reference implementation
+4. `packages/server/src/domain/flashSale.ts` — the business rules
+5. `packages/server/test/flashSale.test.ts` — what "correct" means, executably
+
+**Acceptance criteria.**
+- You can say in one sentence why `reserve()` must be a single atomic step.
+- You can point at the line in `memoryStore.ts` that would break if an `await`
+  were added, and say what would go wrong.
+
+**Verify.**
+```bash
+npm install && npm test        # 12 passing
+npm run dev:web                # UI on :5173, mock adapter, no backend needed
+```
+
+---
+
+## Step 1 — Prove the race exists
+
+**Purpose.** Demonstrate the bug your transaction prevents. This is the single
+highest-value half hour in the project: it turns "I used a transaction because
+it's atomic" into "here is the failure, here is the test that catches it, here
+is why the fix works."
+
+**Files to edit.** `packages/server/src/store/memoryStore.ts` (temporarily).
+
+Split the critical section so the event loop can interleave:
 
 ```ts
 const current = this.#remaining;
-await new Promise((r) => setImmediate(r));   // yields the event loop
+await new Promise((r) => setImmediate(r));   // yields
 if (current <= 0) return { status: 'sold_out' };
 this.#remaining = current - 1;
 ```
 
-Run `npm test`. The oversell test fails — you will sell far more than 10. Put
-it back.
+**Acceptance criteria.**
+- The oversell test fails, selling far more than 10 units.
+- You restore the original code and it passes again.
+- You keep a note of the failure output for the write-up.
 
-This is the single most valuable thing in the whole submission. It turns "I
-used Redis because it is atomic" into "here is the failure mode, here is the
-test that catches it, here is why the fix works." Keep the broken version on a
-branch or in a comment so you can show it in the interview.
+**Verify.**
+```bash
+npm test -- flashSale          # fails loudly, then passes once reverted
+```
 
 ---
 
-## Step 2 — A failing contract test for the real driver (30 min)
+## Step 2 — Write the failing contract tests
 
-Pull the two invariant tests out of `flashSale.test.ts` into a function that
-takes a store factory:
+**Purpose.** Hold every driver to one standard instead of one standard each.
+The tests exist before the implementation, so "done" is defined before you
+start.
+
+**Files to edit.** `packages/server/test/` — extract the two invariant tests
+into a reusable function.
 
 ```ts
 export function itBehavesLikeAnInventoryStore(makeStore: () => InventoryStore) {
@@ -65,172 +102,247 @@ export function itBehavesLikeAnInventoryStore(makeStore: () => InventoryStore) {
 }
 ```
 
-Call it for `MemoryInventoryStore`, then `PostgresInventoryStore`, then
-`RedisInventoryStore`. The latter two fail (the stubs throw) — that is your
-to-do list for step 3, and it means every driver is held to one standard
-rather than one standard each.
+Call it for `MemoryInventoryStore` (passes) and `PostgresInventoryStore`
+(fails — the stub throws `NotImplementedError`).
 
----
+**Acceptance criteria.**
+- Memory suite green, Postgres suite red for the right reason.
+- The Postgres suite skips cleanly when no database is reachable, so `npm test`
+  works on a laptop with nothing running.
 
-## Step 3a — The Postgres driver (2–3 hours) ⭐ the core
-
-`docker compose up -d postgres`, `npm i pg -w @flash/server`, then fill in
-`postgresStore.ts`. The file carries the schema, the full transaction, the
-reason it cannot oversell, and the four things a reviewer looks for.
-
-**This is the driver I would submit as the default.** One system, one source of
-truth, and the `UNIQUE (sale_id, user_id)` index is an independent guarantee of
-one-per-user that no application bug can defeat. For ten units it is very
-likely the correct engineering answer, and being able to say *why Redis would
-be premature here* is worth more than using Redis.
-
-The three details that separate a working version from a good one are in the
-file: `ON CONFLICT` instead of catching `23505`, `clock_timestamp()` instead of
-`now()`, and `INSERT` before the contended `UPDATE`.
-
-Done when:
-- `INVENTORY_DRIVER=postgres npm test` is green — same tests, different driver
-- two API instances on different ports share one database and the stress test
-  still sells exactly 10. *This is the experiment the memory driver cannot
-  pass.*
-
+**Verify.**
 ```bash
-PORT=3001 INVENTORY_DRIVER=postgres npm run dev:server
-PORT=3002 INVENTORY_DRIVER=postgres npm run dev:server
+npm test                       # memory green, postgres red/skipped
 ```
 
-Then push it until it hurts, because the failure mode is the interesting part:
-raise `--users` until latency degrades, and watch **the connection pool**, not
-the row lock, be what breaks. Record the number. "It held 10/10 correct at
-5,000 concurrent, and the limit was pool saturation at N, which PgBouncer
-would move" is a far better answer than a throughput figure with no ceiling
-identified.
+---
 
-Decide and write down what happens when the database is unreachable: **fail
-closed**, 503, no sale, client retries. Never fall back to the memory driver —
-that is how you oversell during an incident.
+## Step 3 — Apply the schema
+
+**Purpose.** Get the constraints in place first. Three of the four transaction
+requirements are enforced by the schema, not by your code — which is the point.
+
+**Files to edit.** `packages/server/db/schema.sql` (review, adjust if you
+disagree with it).
+
+**Acceptance criteria.**
+- `CHECK (remaining_stock >= 0)` exists.
+- `UNIQUE (sale_id, user_id)` exists on `purchases`.
+- Re-running the file is safe: the seed is `ON CONFLICT DO NOTHING`, so a
+  restart mid-sale does not refill the shelf.
+- You can state what each constraint protects against.
+
+**Verify.**
+```bash
+docker compose up -d postgres
+psql postgres://flash:flash@localhost:5432/flashsale -f packages/server/db/schema.sql
+psql postgres://flash:flash@localhost:5432/flashsale -c "\d purchases"
+# run it twice — stock must still read 10
+```
 
 ---
 
-## Step 3b — The Redis driver (2 hours, stretch)
+## Step 4 — Implement the transaction ⭐
 
-Only worth doing once 3a is green and measured. `docker compose up -d redis`,
-`npm i ioredis -w @flash/server`, then fill in `redisStore.ts` — it carries the
-suggested keys, a sketch of the Lua, and its own four review points.
+**Purpose.** The core of the exercise. Everything else is scaffolding around
+this one function.
 
-The one rule: **dedupe check + stock check + decrement must be a single
-command.** Three round trips with application logic between them is the bug
-from step 1, now distributed and much harder to see.
+**Files to edit.** `packages/server/src/store/postgresStore.ts`. The file
+contains the four requirements, the full transaction, the reason it cannot
+oversell, and the five things a reviewer will probe. Install the driver with
+`npm i pg -w @flash/server`.
 
-The payoff is not "Redis is faster" — it is a table in your README with both
-drivers, same stress test, same assertions, different numbers and different
-failure modes. That is the difference between claiming a trade-off and
-demonstrating one.
+**The four requirements** (restated — the file has the detail):
 
-If Redis is unreachable: fail closed, exactly as above.
+| | Requirement | Enforced by |
+|---|---|---|
+| R1 | The sale window is enforced on the server | `clock_timestamp()` in the `UPDATE` predicate |
+| R2 | Stock can never go negative | `remaining_stock > 0` predicate **and** the column `CHECK` |
+| R3 | One purchase per user | `UNIQUE (sale_id, user_id)` constraint |
+| R4 | A failed or duplicate purchase never consumes stock | Stop before the decrement on duplicate; `ROLLBACK` so neither effect survives |
 
-## Step 4 — Durability (1–2 hours)
+R4 is the one most often got wrong: if the `INSERT … ON CONFLICT` returns zero
+rows, the user already owns a unit — you must **not** run the decrement.
 
-**Skip this entirely if you shipped the Postgres driver** — there the
-reservation and the business record are the same committed transaction, so
-there is nothing to drain and nothing to reconcile. Say that in the README; it
-is a point in the design's favour, not an omission.
+**Acceptance criteria.**
+- `INVENTORY_DRIVER=postgres npm test` is green — same tests as memory.
+- A duplicate purchase leaves `remaining_stock` unchanged (assert this
+  explicitly; it is R4).
+- Two API instances against one database still sell exactly 10. **This is the
+  experiment the memory driver cannot pass — it is the one to show off.**
+- The database being unreachable produces a 503, never a sale. Fail closed;
+  never fall back to the memory driver.
 
-It applies to the Redis path. `packages/server/src/persistence/orderSink.ts` is
-the hook: replace the no-op with an `XADD` onto a Redis Stream, and write a
-worker that reads the stream and inserts into Postgres using the schema in
-`postgresStore.ts`.
+**Verify.**
+```bash
+INVENTORY_DRIVER=postgres npm test
 
-Keep it strictly off the hot path: the HTTP response is decided before the sink
-is called. If you are short on time, implement the enqueue and describe the
-worker in the README rather than building both badly.
-
----
-
-## Step 5 — Shed the read load (45 min, high value per minute)
-
-1. **Cache `GET /api/sale`.** A 1-second per-process memo is ~10 lines and cuts
-   read load on the store by orders of magnitude. Note in the README that the
-   production version is a CDN with a 1s TTL.
-2. **Rate limit `POST /api/purchase`.** `@fastify/rate-limit`, keyed on user
-   identifier *and* IP. Flash sales attract scripts; this is where you say so.
-3. **Set a connection cap and a request timeout.** A server that sheds load
-   under overload stays up; one that accepts everything falls over.
+PORT=3001 INVENTORY_DRIVER=postgres npm run dev:server
+PORT=3002 INVENTORY_DRIVER=postgres npm run dev:server
+node stress/run.mjs --url http://localhost:3001 --users 2000
+psql …flashsale -c "SELECT remaining_stock FROM sales WHERE id=1"   -- 0
+psql …flashsale -c "SELECT count(*), count(DISTINCT user_id) FROM purchases"  -- 10, 10
+```
 
 ---
 
-## Step 6 — Failure modes (1 hour, mostly writing)
+## Step 5 — Classify outcomes, then switch the UI to live
 
-Answer these in the README. They are what "robustness" means in the brief, and
-they are the likeliest interview questions:
+**Purpose.** A zero-row `UPDATE` cannot say *why* it failed, but sold out, not
+started and ended are three different screens. This step is what makes the UI
+you already have tell the truth.
 
-- **An API instance dies mid-request.** Nothing is lost: the reservation either
-  committed atomically or did not happen. The client retries safely because
-  `reserve` is keyed by user — a retry returns `already_purchased`.
-- **The database dies** (Postgres path). Nothing is oversold — no transaction
-  commits, so every request fails closed with a 503 and retries safely. Restore
-  is a normal restore; there is no divergent in-memory truth to reconcile.
-- **Redis dies** (Redis path). AOF `everysec` (already in `docker-compose.yml`)
-  bounds the loss to ~1s of reservations. Add a replica for failover. On cold start,
-  rebuild stock from Postgres rather than re-seeding blindly — otherwise a
-  restart refills the shelf and you oversell. This is why `init` must use
-  `SET … NX`.
-- **The worker falls behind** (Redis path only). Users hold valid reservations that are not yet in
-  Postgres. Acceptable: the queue drains. Add a reconciliation job that compares
-  Redis order count against `SELECT count(*)` and alerts on drift.
-- **A node's clock is wrong.** The sale boundary is read from one server's
-  clock. Mention NTP, and that moving the window check into the Lua script
-  removes the skew entirely at the cost of one branch in the hot path.
+**Files to edit.** `packages/server/src/store/postgresStore.ts` (add the
+classifying `SELECT`), then `packages/web/.env` or the URL to leave mock mode.
 
----
+**Acceptance criteria.**
+- Each of `sold_out`, `sale_not_started`, `sale_ended` is returned distinctly.
+- `?api=live` renders the same screens the mock scenarios do.
+- The mock adapter still works untouched — it is a preview tool, not a
+  fallback, and must never silently substitute for a broken backend.
 
-## Step 7 — Make the testing section earn its marks (1–2 hours)
-
-The brief asks you to *explain* your stress results, so the write-up matters as
-much as the run.
-
-- Port `stress/run.mjs` to k6 for a ramping profile and threshold-based
-  pass/fail (`k6 run --vus 2000 --duration 30s`). Keep the Node script — "no
-  dependencies, runs anywhere" is a feature.
-- Run the generator from a different machine (or a container with a CPU limit)
-  so the numbers measure the server, not the client. State the setup next to
-  the numbers.
-- Add the soak variant: hammer `GET /api/sale` throughout the purchase burst and
-  show reads do not starve writes.
-- Add the failure test: kill an API instance mid-run and show the invariants
-  still hold.
-
-Put a short table in the README: scenario, requests, winners, p99, verdict.
+**Verify.**
+```bash
+npm run dev:server & npm run dev:web
+open 'http://localhost:5173/?api=live'
+SALE_START_AT=2027-01-01T00:00:00Z npm run dev:server   # upcoming screen
+TOTAL_STOCK=1 npm run dev:server                        # sold out after one
+```
 
 ---
 
-## Step 8 — The write-up (1 hour)
+## Step 6 — Shed the read load
 
-The README has the skeleton of this already; make the reasoning yours.
+**Purpose.** `GET /api/sale` is the real traffic: 50k browsers polling every 2s
+is 25k req/s against a single number. Cheapest systems-thinking marks in the
+project.
 
-- The diagram is in the README as ASCII. If you prefer a picture, redraw it in
-  Excalidraw or Mermaid and commit the export — do not leave both.
-- For every component, one sentence on what you would *remove* if traffic were
-  10x smaller. Knowing when a queue is overkill reads as better judgement than
-  adding one everywhere.
-- Be explicit about what you did not build and why. "I mocked persistence to
-  spend the time on concurrency correctness, which is where the risk is" is a
-  strong answer. Silence looks like an oversight.
+**Files to edit.** `packages/server/src/routes/sale.ts`, `src/app.ts`.
+
+**Acceptance criteria.**
+- `GET /api/sale` is memoised for ~1s; the store sees roughly one read per
+  second regardless of request rate. Note in the README that production puts a
+  CDN with a 1s TTL here.
+- `POST /api/purchase` is rate limited, keyed on user identifier **and** IP.
+- A request timeout and connection cap exist, so overload sheds rather than
+  topples.
+- Once stock is zero, losers are answered without opening a transaction.
+
+**Verify.**
+```bash
+npm i @fastify/rate-limit -w @flash/server
+node stress/run.mjs --users 3000      # latency should drop against step 4
+```
 
 ---
 
-## Things that cost people marks
+## Step 7 — Failure modes
 
-- **Overselling under load.** Everything else is secondary; the stress test must
-  prove it.
-- **"One per user" enforced in the frontend.** Disabling the button is UX. The
-  only enforcement that counts is inside the atomic step.
-- **A queue in the diagram that does nothing.** Either wire it up or explain why
-  it is out of scope. An unexplained box reads as cargo cult — and so does
-  Redis in front of a ten-unit sale with no measurement to justify it.
-- **Tests that only cover the happy path.** The interesting cases are the ones
-  that must *fail*: second purchase, sold out, before the window, after it.
-- **Unexplained numbers.** "1844 req/s" alone means nothing. Say what was
-  running where, and what the bottleneck was.
+**Purpose.** "Robustness" in the brief means having answers to these. They are
+also the likeliest interview questions.
+
+**Files to edit.** `README.md`.
+
+**Acceptance criteria.** A paragraph each on:
+- **An API instance dies mid-request.** Nothing is lost — the transaction
+  either committed or did not. Retry is safe because `reserve` is keyed by user
+  and returns `already_purchased`.
+- **The database is unreachable.** Fail closed: 503, no sale, nothing
+  oversold, no divergent in-memory truth to reconcile. (This is a genuine
+  advantage of the Postgres path — say so.)
+- **Connection pool exhaustion.** The real bottleneck. PgBouncer in transaction
+  mode, short transactions, `lock_timeout` and `statement_timeout`.
+- **A node's clock is wrong.** Why the window check belongs in SQL
+  (`clock_timestamp()`, one clock) rather than per-node.
+
+**Verify.** Have someone read it who has not seen the code.
+
+---
+
+## Step 8 — Stress testing
+
+**Purpose.** The brief asks you to *explain* your results, so the write-up
+counts as much as the run. `stress/run.mjs` is a starting point, not a finished
+suite — it asserts the invariants but measures the client as much as the server.
+
+**Files to edit.** `stress/run.mjs`, optionally a new `stress/purchase.k6.js`.
+
+**Acceptance criteria.**
+- The generator runs on different hardware (or a CPU-limited container) from
+  the API, and you say so next to the numbers.
+- A table: scenario, requests, winners, p99, verdict.
+- You push `--users` until something degrades and **name what broke** — it
+  should be pool saturation, not the row lock. "Held 10/10 correct at 5,000
+  concurrent; limit was pool saturation at N, which PgBouncer would move" beats
+  any throughput figure with no ceiling identified.
+- A failure run: kill an instance mid-test, show the invariants still hold.
+
+**Verify.**
+```bash
+npm run stress -- --users 5000 --concurrency 500
+```
+
+---
+
+## Step 9 — Final write-up
+
+**Purpose.** Pragmatism is explicitly on the mark scheme. Explaining a choice
+counts as much as making it.
+
+**Files to edit.** `README.md`.
+
+**Acceptance criteria.**
+- The implemented-vs-planned table matches reality.
+- For each component, one line on what you would **remove** at 10x less
+  traffic. Knowing when a queue is overkill reads better than adding one
+  everywhere.
+- What you did not build, and why. "I mocked persistence to spend the time on
+  concurrency correctness, which is where the risk is" is a strong answer;
+  silence looks like an oversight.
+- The diagram marks planned components distinctly from built ones.
+
+---
+
+## Optional — the Redis extension
+
+**Only after step 4 is green and measured.** This is an extension, not a
+requirement, and it is the wrong default for a ten-unit sale.
+
+**Purpose.** To *measure* the trade-off rather than assert it: same stress
+test, same assertions, two drivers, different numbers and different failure
+modes.
+
+**Files to edit.** `packages/server/src/store/redisStore.ts` (stub with the Lua
+sketch), `src/persistence/orderSink.ts` (the queue hook — only needed on this
+path, because Redis is not the durable record).
+
+**Acceptance criteria.**
+- Dedupe check, stock check and decrement are a **single** Lua script. Three
+  round trips with logic between them is step 1's bug, distributed.
+- `init` uses `SET … NX` so a restart mid-sale does not refill the shelf.
+- A cold start rebuilds stock from Postgres rather than re-seeding.
+- You can state what reconciliation this path now owes that Postgres did not.
+
+**Verify.**
+```bash
+docker compose up -d redis
+INVENTORY_DRIVER=redis npm test
+```
+
+---
+
+## Things that cost marks
+
+- **Overselling under load.** Everything else is secondary.
+- **"One per user" enforced in the frontend.** Disabling the button is UX. Only
+  the constraint and the atomic step count.
+- **A queue in the diagram that does nothing** — or Redis in front of a
+  ten-unit sale with no measurement to justify it. Unexplained boxes read as
+  cargo cult.
+- **Tests that only cover the happy path.** The interesting cases must *fail*:
+  second purchase, sold out, before the window, after it.
+- **Unexplained numbers.** Say what ran where, and what the bottleneck was.
+- **Mock data presented as real.** The mock adapter is labelled on screen for
+  exactly this reason; keep it that way.
 - **Not being able to explain your own code.** Rewrite anything you would not
   defend line by line.

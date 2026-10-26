@@ -1,40 +1,37 @@
-import type {
-  PurchaseLookupResponse,
-  PurchaseResponse,
-  SaleStateResponse,
-} from '@flash/shared';
+import * as httpApi from './httpApi.ts';
+import * as mockApi from './mockApi.ts';
+import { readScenario } from './mockApi.ts';
+
+export { ApiNotImplementedError } from './apiError.ts';
+export type { MockScenario } from './mockApi.ts';
+
+export type ApiMode = 'mock' | 'live';
 
 /**
- * Thin typed wrapper over fetch.
+ * Which adapter the app talks to.
  *
- * Note that 409 and 400 are *expected* answers here, not failures: "sold out"
- * and "already purchased" are outcomes the UI renders, so they are parsed
- * rather than thrown. Only transport failures and 5xx become exceptions.
+ * Default is **mock**, because the backend's purchase transaction is still a
+ * stub (GUIDE.md step 4) — the UI must be demoable and reviewable before that
+ * exists. Switch with `?api=live` in the URL, or VITE_API_MODE=live at build
+ * time, once you have a driver that works.
+ *
+ * Whenever the mock is active the UI shows a labelled banner. Simulated data
+ * must never be mistakable for real data.
  */
-async function parse<T>(response: Response, allowed: number[]): Promise<T> {
-  if (!allowed.includes(response.status)) {
-    throw new Error(`Request failed with ${response.status}`);
-  }
-  return (await response.json()) as T;
+function resolveMode(): ApiMode {
+  const override = new URLSearchParams(window.location.search).get('api');
+  if (override === 'live' || override === 'mock') return override;
+  return import.meta.env.VITE_API_MODE === 'live' ? 'live' : 'mock';
 }
 
-export async function fetchSaleState(signal?: AbortSignal): Promise<SaleStateResponse> {
-  return parse<SaleStateResponse>(await fetch('/api/sale', { signal }), [200]);
-}
+export const API_MODE: ApiMode = resolveMode();
+export const MOCK_SCENARIO = readScenario();
 
-export async function attemptPurchase(userId: string): Promise<PurchaseResponse> {
-  const response = await fetch('/api/purchase', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ userId }),
-  });
-  return parse<PurchaseResponse>(response, [200, 201, 400, 409]);
-}
+const adapter = API_MODE === 'mock' ? mockApi : httpApi;
 
-export async function fetchExistingOrder(userId: string): Promise<PurchaseLookupResponse> {
-  const response = await fetch(`/api/purchase/${encodeURIComponent(userId)}`);
-  return parse<PurchaseLookupResponse>(response, [200, 400]);
-}
+export const fetchSaleState = adapter.fetchSaleState;
+export const attemptPurchase = adapter.attemptPurchase;
+export const fetchExistingOrder = adapter.fetchExistingOrder;
 
 export function formatPrice(cents: number, currency: string): string {
   return new Intl.NumberFormat('en-US', {

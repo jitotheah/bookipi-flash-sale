@@ -1,4 +1,5 @@
 import type { Order } from '@flash/shared';
+import { NotImplementedError } from '../errors.ts';
 import type { InventoryStore, ReservationResult } from './inventoryStore.ts';
 
 /**
@@ -57,19 +58,19 @@ export class RedisInventoryStore implements InventoryStore {
   ) {}
 
   async init(_totalStock: number): Promise<void> {
-    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3b');
+    throw new NotImplementedError('RedisInventoryStore.init()', 'the optional Redis extension');
   }
 
   async reserve(_userId: string, _orderId: string, _at: Date): Promise<ReservationResult> {
-    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3b');
+    throw new NotImplementedError('RedisInventoryStore.reserve()', 'the optional Redis extension');
   }
 
   async findOrder(_userId: string): Promise<Order | null> {
-    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3b');
+    throw new NotImplementedError('RedisInventoryStore.findOrder()', 'the optional Redis extension');
   }
 
   async remaining(): Promise<number> {
-    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3b');
+    throw new NotImplementedError('RedisInventoryStore.remaining()', 'the optional Redis extension');
   }
 
   async close(): Promise<void> {

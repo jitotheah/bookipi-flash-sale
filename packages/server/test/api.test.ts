@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../src/app.ts';
 import { MemoryInventoryStore } from '../src/store/memoryStore.ts';
+import { PostgresInventoryStore } from '../src/store/postgresStore.ts';
 import { testConfig } from './helpers.ts';
 
 let app: FastifyInstance;
@@ -84,5 +85,27 @@ describe('API', () => {
     const outcomes = responses.map((r) => r.json().outcome);
     expect(outcomes.filter((o) => o === 'purchased')).toHaveLength(10);
     expect(outcomes.filter((o) => o === 'sold_out')).toHaveLength(290);
+  });
+});
+
+describe('unimplemented drivers', () => {
+  it('boots and answers 501 rather than crashing or faking a result', async () => {
+    app = await buildApp({
+      config: testConfig({ inventoryDriver: 'postgres' }),
+      store: new PostgresInventoryStore('postgres://unused'),
+    });
+
+    const sale = await app.inject({ method: 'GET', url: '/api/sale' });
+    expect(sale.statusCode).toBe(501);
+    expect(sale.json()).toMatchObject({ outcome: 'not_implemented' });
+    expect(sale.json().message).toContain('GUIDE.md step 4');
+
+    const purchase = await app.inject({
+      method: 'POST',
+      url: '/api/purchase',
+      payload: { userId: 'ada' },
+    });
+    expect(purchase.statusCode).toBe(501);
+    expect(purchase.json().outcome).toBe('not_implemented');
   });
 });
