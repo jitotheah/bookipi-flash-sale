@@ -9,8 +9,13 @@ import type { Order } from '@flash/shared';
  * the purchase path, and a database outage must never turn a reservation the
  * user already owns into an error.
  *
- * GUIDE.md step 4: replace the no-op with a push onto a Redis Stream / SQS
- * queue, and write a worker that drains it into Postgres.
+ * This hook exists for the Redis driver, where the reservation lives somewhere
+ * that is not yet the durable business record. The Postgres driver has no use
+ * for it: there the reservation and the record are the same committed
+ * transaction, so the no-op stays a no-op.
+ *
+ * GUIDE.md step 4: for the Redis path, replace the no-op with a push onto a
+ * Redis Stream / SQS queue, and write a worker that drains it into Postgres.
  */
 export interface OrderSink {
   record(order: Order): void;

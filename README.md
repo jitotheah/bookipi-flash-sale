@@ -9,9 +9,9 @@ may win. This repo is structured so that the concurrency decision is a single,
 reviewable seam rather than something smeared across the codebase.
 
 > **Status: skeleton.** The in-memory path is complete, tested and passing a
-> load test. The distributed path (Redis, durable persistence, caching, rate
-> limiting) is stubbed with the contract it must satisfy. See
-> [`GUIDE.md`](./GUIDE.md) for the build order.
+> load test. The two production drivers (Postgres, Redis) and the surrounding
+> concerns (durable persistence, caching, rate limiting) are stubbed with the
+> contracts they must satisfy. See [`GUIDE.md`](./GUIDE.md) for the build order.
 
 ---
 
@@ -43,68 +43,132 @@ reviewable seam rather than something smeared across the codebase.
                                      │  ONE atomic command
                                      ▼
                       ╔══════════════════════════════╗
-                      ║  Redis — the serialisation   ║
-                      ║  point and ONLY source of    ║
-                      ║  truth for "who won"         ║
-                      ║                              ║
-                      ║  Lua script, run to          ║
-                      ║  completion, no interleaving:║
+                      ║  THE SERIALISATION POINT     ║
+                      ║  one atomic step, O(1):      ║
                       ║   1. has this user bought?   ║
                       ║   2. is stock > 0?           ║
                       ║   3. decrement + record      ║
+                      ║                              ║
+                      ║  pluggable — see below:      ║
+                      ║   · Postgres transaction     ║
+                      ║   · Redis Lua script         ║
                       ╚══════════════┬═══════════════╝
-                                     │  async, off the hot path
-                                     ▼
-                      ┌──────────────────────────────┐
-                      │  Queue (Redis Stream / SQS)  │
-                      └──────────────┬───────────────┘
-                                     ▼
-                      ┌──────────────────────────────┐
-                      │  Worker ──► PostgreSQL       │
-                      │  durable orders, receipts,   │
-                      │  fulfilment, reconciliation  │
-                      └──────────────────────────────┘
+                                     │
+            ┌────────────────────────┴────────────────────────┐
+            │                                                 │
+    ╌╌ Postgres driver ╌╌                            ╌╌ Redis driver ╌╌
+    The transaction IS the                     The reservation is acknowledged
+    durable business record.                   by Redis; the durable record is
+    Nothing downstream.                        written off the hot path:
+                                                               │
+                                                               ▼
+                                               ┌──────────────────────────┐
+                                               │ Queue (Redis Stream/SQS) │
+                                               └────────────┬─────────────┘
+                                                            ▼
+                                               ┌──────────────────────────┐
+                                               │ Worker ──► PostgreSQL    │
+                                               │ + reconciliation job     │
+                                               └──────────────────────────┘
 ```
 
 ### Why this shape
 
 **One serialisation point, as small as possible.** Overselling is only
 preventable if something, somewhere, orders the requests. The design makes that
-point explicit and makes the work it does O(1): a single Lua script. Everything
-else — TLS, JSON parsing, validation, the time-window check — happens on
-stateless API nodes that scale horizontally.
-
-**Why Redis and not `UPDATE … SET stock = stock - 1 WHERE stock > 0`.** The SQL
-version is *correct*; it is not *fast*. Every concurrent buyer queues behind a
-row lock on one row, so throughput is capped at roughly one transaction per
-lock round-trip and connection-pool exhaustion takes the rest of the API down
-with it. Redis is single-threaded and executes a Lua script atomically, giving
-the same guarantee at ~100k ops/s. Trade-off: Redis is not durable by default,
-which is why Postgres stays in the picture.
-
-**Writes are acknowledged by Redis, persisted by a worker.** A buyer's answer
-depends only on the atomic reservation, so a slow or down database cannot add
-latency to the purchase path or turn a reservation the user already holds into
-an error. Cost: the durable record is eventually consistent, and recovery needs
-a reconciliation job (GUIDE.md step 6).
+point explicit and makes the work it does O(1). Everything else — TLS, JSON
+parsing, validation, the time-window check — happens on stateless API nodes
+that scale horizontally.
 
 **`GET /api/sale` is the real traffic.** 50k browsers polling every 2s is 25k
 req/s of pure reads against a single number. One cached response serving all of
 them is the difference between flat read load and a melted inventory store.
+This is true for every driver below.
+
+---
+
+## 2. Choosing the serialisation point
+
+`src/store/inventoryStore.ts` defines one contract — *the dedupe check, the
+stock check and the decrement are one indivisible step* — and three drivers
+satisfy it. Picking between them is the central engineering judgement in this
+project, so both candidates are stated fairly rather than one being set up to
+lose.
+
+### Postgres: one system, durable, correct
+
+```sql
+BEGIN;
+  INSERT INTO purchases (order_id, sale_id, user_id) VALUES ($1, $2, $3)
+  ON CONFLICT (sale_id, user_id) DO NOTHING          -- zero rows = already bought
+  RETURNING order_id, created_at;
+
+  UPDATE sales SET remaining_stock = remaining_stock - 1
+   WHERE id = $2 AND remaining_stock > 0
+     AND clock_timestamp() >= starts_at AND clock_timestamp() < ends_at
+  RETURNING remaining_stock;                          -- zero rows = refuse
+COMMIT;
+```
+
+This is safe, and the reason is worth stating precisely: under `READ COMMITTED`
+a blocked `UPDATE` **re-evaluates its `WHERE` clause against the row version
+written by the transaction it waited for** (EvalPlanQual), so `remaining_stock
+> 0` is tested *after* the wait. Under `REPEATABLE READ` the same statement
+raises a `40001` serialization failure instead and needs a bounded retry loop.
+
+Three details that make or break it:
+
+- `ON CONFLICT`, not catching `23505` — a unique violation aborts the whole
+  transaction, so you could not then look up the original order to return.
+- `clock_timestamp()`, not `now()` — `now()` is transaction-*start* time, and
+  this statement may have blocked on the row lock. It also judges the window by
+  **one** clock however many API nodes exist, which is strictly better than
+  checking the window per-node as this skeleton currently does.
+- `INSERT` before `UPDATE` — shortens the time the contended `sales` row lock
+  is held.
+
+**Its real bottleneck is the connection pool, not the row lock.** Thousands of
+concurrent buyers against a pool of tens means requests queue *inside the API*:
+latency climbs, timeouts cascade, and the API falls over while Postgres sits
+there healthy. Mitigate with PgBouncer in transaction mode, short transactions,
+`lock_timeout` / `statement_timeout` so waiters fail fast, and a cached
+sold-out flag so the ~99% of losers never open a transaction at all.
+
+### Redis: highest throughput, durability bolted back on
+
+A Lua script runs to completion with nothing interleaved, giving the same
+guarantee at ~100k ops/s with one network round trip, and removing the row-lock
+queue entirely. The price: Redis is not durable by default, so the business
+record moves to an async worker and you now owe a reconciliation job, an AOF
+policy, and a cold-start rule that rebuilds stock from Postgres rather than
+re-seeding (otherwise a restart refills the shelf and you oversell).
+
+### The honest verdict
+
+For **10 units and a one-hour window, Postgres alone is the right answer** —
+one system, one source of truth, no eventual consistency to explain, and the
+unique index is an independent guarantee of one-per-user that no application
+bug can defeat. Redis earns its place when sustained write throughput on the
+contended row becomes the limit, not before. Reaching for it at this scale is
+the kind of unjustified complexity the brief calls out.
+
+Both are kept behind the same interface so the choice is a config change and
+the same contract tests run against either — which turns the trade-off from an
+assertion into a measurement.
 
 ### Trade-offs taken deliberately
 
 | Decision | Bought | Paid |
 |---|---|---|
-| Redis as source of truth for the sale | O(1) atomic reservation, huge throughput | Needs AOF + replica + reconciliation to be durable |
-| Async persistence to Postgres | Purchase latency independent of the DB | Eventual consistency; a drain lag window |
-| Time window checked in the API, not in Lua | Pre-sale flood rejected without an inventory round-trip | A request within clock-skew of the boundary could slip |
+| One pluggable serialisation point | Concurrency lives in one reviewable file; drivers are swappable | A layer of indirection over "just call the DB" |
+| Postgres as the default driver | Durable, one system, no reconciliation | Throughput capped by row-lock + pool; needs load shedding |
+| Redis as the scale-out driver | O(1) reservation, ~100k ops/s | Needs AOF, replica, worker and reconciliation to be durable |
+| Async persistence (Redis path only) | Purchase latency independent of the DB | Eventual consistency; a drain-lag window |
+| Time window checked in the API | Pre-sale flood rejected without an inventory round-trip | N nodes means N clocks; the Postgres driver fixes this with `clock_timestamp()` |
 | `remainingStock` exposed in the sale response | Honest, motivating UI | Cache-busting if served uncached; it is advisory only |
 | User identifier typed by the shopper | Matches the brief, demoable | Trivially bypassed — production must key on an authenticated account |
 
----
-
-## 2. What is built, what is not
+## 3. What is built, what is not
 
 | Area | State |
 |---|---|
@@ -113,14 +177,15 @@ them is the difference between flat read load and a melted inventory store.
 | Sale window, one-per-user, limited stock, outcome → HTTP mapping | **Done** |
 | In-memory inventory driver + unit and integration tests (11 passing) | **Done** |
 | Load generator asserting *no oversell* and *one per user* | **Done** |
-| Redis driver (the Lua script) | **Stub** — GUIDE.md step 3 |
-| Durable persistence + queue worker | **Stub** — GUIDE.md step 4 |
+| Postgres driver (transaction + unique index) | **Stub** — GUIDE.md step 3a |
+| Redis driver (the Lua script) | **Stub** — GUIDE.md step 3b |
+| Durable persistence + queue worker (Redis path only) | **Stub** — GUIDE.md step 4 |
 | Response caching, rate limiting | **Not started** — GUIDE.md step 5 |
 | Failure handling & reconciliation | **Not started** — GUIDE.md step 6 |
 
 ---
 
-## 3. Running it
+## 4. Running it
 
 ```bash
 npm install
@@ -191,7 +256,7 @@ ceiling needs the generator on separate hardware — see GUIDE.md step 7.
 
 ---
 
-## 4. API
+## 5. API
 
 | Method | Path | Returns |
 |---|---|---|
@@ -206,7 +271,7 @@ browser run its countdown off the server's clock rather than the laptop's.
 
 ---
 
-## 5. Layout
+## 6. Layout
 
 ```
 packages/shared   API contract shared by both sides — one breaking change
@@ -214,7 +279,8 @@ packages/shared   API contract shared by both sides — one breaking change
 packages/server   Fastify API
   src/config.ts        all env parsing, in one place
   src/domain/          business rules, no HTTP
-  src/store/           ◄── the concurrency boundary (memory | redis)
+  src/store/           ◄── the concurrency boundary
+                       (memory | postgres | redis)
   src/routes/          outcome → status code
   src/persistence/     durable-write hook
   test/                unit + integration
@@ -224,6 +290,7 @@ stress/run.mjs    load generator with correctness assertions
 
 The whole design rests on one interface, `src/store/inventoryStore.ts`: *the
 dedupe check, the stock check and the decrement are one indivisible step.* The
-memory driver gets that from Node's single thread; the Redis driver gets it
-from a Lua script. Both are held to the same contract, so swapping them is a
-config change.
+memory driver gets that from Node's single thread, the Postgres driver from a
+transaction plus a unique index, the Redis driver from a Lua script. All three
+are held to the same contract, so swapping them is a config change — and the
+same tests prove all three.

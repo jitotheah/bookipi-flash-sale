@@ -1,6 +1,6 @@
 import type { Product } from '@flash/shared';
 
-export type InventoryDriver = 'memory' | 'redis';
+export type InventoryDriver = 'memory' | 'postgres' | 'redis';
 
 export interface SaleConfig {
   product: Product;
@@ -8,6 +8,7 @@ export interface SaleConfig {
   endsAt: Date;
   totalStock: number;
   inventoryDriver: InventoryDriver;
+  databaseUrl: string;
   redisUrl: string;
   port: number;
   host: string;
@@ -56,9 +57,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SaleConfig {
     throw new Error('SALE_END_AT must be after SALE_START_AT');
   }
 
+  const drivers: InventoryDriver[] = ['memory', 'postgres', 'redis'];
   const driver = (env.INVENTORY_DRIVER ?? 'memory') as InventoryDriver;
-  if (driver !== 'memory' && driver !== 'redis') {
-    throw new Error(`Unknown INVENTORY_DRIVER "${driver}" (expected "memory" or "redis")`);
+  if (!drivers.includes(driver)) {
+    throw new Error(
+      `Unknown INVENTORY_DRIVER "${driver}" (expected one of: ${drivers.join(', ')})`,
+    );
   }
 
   return {
@@ -67,6 +71,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SaleConfig {
     endsAt,
     totalStock: parseInteger(env.TOTAL_STOCK, 10),
     inventoryDriver: driver,
+    databaseUrl: env.DATABASE_URL ?? 'postgres://flash:flash@localhost:5432/flashsale',
     redisUrl: env.REDIS_URL ?? 'redis://localhost:6379',
     port: parseInteger(env.PORT, 3000),
     host: env.HOST ?? '0.0.0.0',

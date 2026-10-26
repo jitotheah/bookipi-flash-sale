@@ -3,15 +3,24 @@ import type { InventoryStore, ReservationResult } from './inventoryStore.ts';
 
 /**
  * ============================================================================
- *  GUIDE.md step 3 -- THIS IS THE CORE OF THE EXERCISE. Write it yourself.
+ *  GUIDE.md step 3b -- the scale-out driver. Write it yourself.
  * ============================================================================
  *
- * Why Redis rather than `UPDATE sales SET stock = stock - 1 WHERE stock > 0`:
- * the SQL version is correct, but every one of the thousands of concurrent
- * buyers queues behind a row lock on a single row, so throughput collapses to
- * one transaction per row-lock round trip. Redis is single-threaded and runs a
- * Lua script to completion with nothing interleaved, which gives the same
- * guarantee at ~100k ops/s with one network round trip.
+ * Read `postgresStore.ts` first. That driver is the one to submit as the
+ * default: it is durable, it is one system, and for ten units it is very
+ * likely the right answer. This file is what you reach for when sustained
+ * write throughput on the contended row becomes the limit -- and the point of
+ * building it is to *measure* that trade-off rather than assert it.
+ *
+ * What Redis buys: Postgres serialises every buyer behind a row lock on one
+ * row and, well before that lock is the limit, behind a connection pool of
+ * tens. Redis is single-threaded and runs a Lua script to completion with
+ * nothing interleaved, giving the same guarantee at ~100k ops/s with one
+ * network round trip and no pool to exhaust.
+ *
+ * What it costs: Redis is not durable by default, so the business record moves
+ * to an async worker (step 4) and you now owe a reconciliation job, an AOF
+ * policy, and a cold-start rule -- none of which the Postgres driver needs.
  *
  * The contract you must satisfy (same as MemoryInventoryStore):
  *   dedupe check + stock check + decrement happen as ONE atomic step.
@@ -48,19 +57,19 @@ export class RedisInventoryStore implements InventoryStore {
   ) {}
 
   async init(_totalStock: number): Promise<void> {
-    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3');
+    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3b');
   }
 
   async reserve(_userId: string, _orderId: string, _at: Date): Promise<ReservationResult> {
-    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3');
+    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3b');
   }
 
   async findOrder(_userId: string): Promise<Order | null> {
-    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3');
+    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3b');
   }
 
   async remaining(): Promise<number> {
-    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3');
+    throw new Error('RedisInventoryStore is not implemented yet -- see GUIDE.md step 3b');
   }
 
   async close(): Promise<void> {

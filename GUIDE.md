@@ -5,9 +5,11 @@ The skeleton gives you a system that is already correct and already load-tested
 a distributed design. Each step is independently demoable, so if you run out of
 time you stop at a working state rather than a half-finished one.
 
-**Suggested budget: ~8 hours.** Steps 1–3 and 7 are the ones that get marked.
-Step 5 is cheap and shows systems thinking. Steps 4 and 6 can be partly written
-up instead of built, as long as you say so.
+**Suggested budget: ~8 hours.** Steps 1, 2, 3a and 7 are the ones that get
+marked. Step 5 is cheap and shows systems thinking. Step 3b is the stretch
+goal: do it if you want to *measure* the Postgres-vs-Redis trade-off rather
+than assert it. Steps 4 and 6 can be partly written up instead of built, as
+long as you say so.
 
 ---
 
@@ -63,50 +65,81 @@ export function itBehavesLikeAnInventoryStore(makeStore: () => InventoryStore) {
 }
 ```
 
-Call it for `MemoryInventoryStore`, then for `RedisInventoryStore`. The Redis
-suite fails (the stub throws) — that is your to-do list for step 3, and it
-means both drivers are held to one standard rather than two.
+Call it for `MemoryInventoryStore`, then `PostgresInventoryStore`, then
+`RedisInventoryStore`. The latter two fail (the stubs throw) — that is your
+to-do list for step 3, and it means every driver is held to one standard
+rather than one standard each.
 
 ---
 
-## Step 3 — The Redis driver (2–3 hours) ⭐ the core
+## Step 3a — The Postgres driver (2–3 hours) ⭐ the core
 
-`docker compose up -d redis`, `npm i ioredis -w @flash/server`, then fill in
-`redisStore.ts`. The file carries the suggested keys, a sketch of the Lua, and
-the four things a reviewer looks for.
+`docker compose up -d postgres`, `npm i pg -w @flash/server`, then fill in
+`postgresStore.ts`. The file carries the schema, the full transaction, the
+reason it cannot oversell, and the four things a reviewer looks for.
+
+**This is the driver I would submit as the default.** One system, one source of
+truth, and the `UNIQUE (sale_id, user_id)` index is an independent guarantee of
+one-per-user that no application bug can defeat. For ten units it is very
+likely the correct engineering answer, and being able to say *why Redis would
+be premature here* is worth more than using Redis.
+
+The three details that separate a working version from a good one are in the
+file: `ON CONFLICT` instead of catching `23505`, `clock_timestamp()` instead of
+`now()`, and `INSERT` before the contended `UPDATE`.
+
+Done when:
+- `INVENTORY_DRIVER=postgres npm test` is green — same tests, different driver
+- two API instances on different ports share one database and the stress test
+  still sells exactly 10. *This is the experiment the memory driver cannot
+  pass.*
+
+```bash
+PORT=3001 INVENTORY_DRIVER=postgres npm run dev:server
+PORT=3002 INVENTORY_DRIVER=postgres npm run dev:server
+```
+
+Then push it until it hurts, because the failure mode is the interesting part:
+raise `--users` until latency degrades, and watch **the connection pool**, not
+the row lock, be what breaks. Record the number. "It held 10/10 correct at
+5,000 concurrent, and the limit was pool saturation at N, which PgBouncer
+would move" is a far better answer than a throughput figure with no ceiling
+identified.
+
+Decide and write down what happens when the database is unreachable: **fail
+closed**, 503, no sale, client retries. Never fall back to the memory driver —
+that is how you oversell during an incident.
+
+---
+
+## Step 3b — The Redis driver (2 hours, stretch)
+
+Only worth doing once 3a is green and measured. `docker compose up -d redis`,
+`npm i ioredis -w @flash/server`, then fill in `redisStore.ts` — it carries the
+suggested keys, a sketch of the Lua, and its own four review points.
 
 The one rule: **dedupe check + stock check + decrement must be a single
 command.** Three round trips with application logic between them is the bug
 from step 1, now distributed and much harder to see.
 
-Done when:
-- `INVENTORY_DRIVER=redis npm test` is green — same tests, different driver
-- two API instances on different ports share one Redis, and the stress test run
-  against both still sells exactly 10. *This is the experiment the memory
-  driver cannot pass, and it is the one to show off.*
+The payoff is not "Redis is faster" — it is a table in your README with both
+drivers, same stress test, same assertions, different numbers and different
+failure modes. That is the difference between claiming a trade-off and
+demonstrating one.
 
-```bash
-PORT=3001 INVENTORY_DRIVER=redis npm run dev:server
-PORT=3002 INVENTORY_DRIVER=redis npm run dev:server
-# point the load generator at each in turn, or put nginx in front
-```
-
-Decide and write down what happens when Redis is unreachable. The answer should
-be **fail closed**: 503, no sale, client retries. Never fall back to the memory
-driver — that is how you oversell during an incident.
-
----
+If Redis is unreachable: fail closed, exactly as above.
 
 ## Step 4 — Durability (1–2 hours)
 
-`packages/server/src/persistence/orderSink.ts` is the hook. Replace the no-op
-with an `XADD` onto a Redis Stream, and write a worker that reads the stream
-and inserts into Postgres (`docker compose up -d postgres`).
+**Skip this entirely if you shipped the Postgres driver** — there the
+reservation and the business record are the same committed transaction, so
+there is nothing to drain and nothing to reconcile. Say that in the README; it
+is a point in the design's favour, not an omission.
 
-Schema is small: `orders(order_id uuid pk, user_id text unique, created_at
-timestamptz)`. The `unique` on `user_id` is a second, independent guarantee of
-one-per-user — a safety net at the storage layer if the reservation logic ever
-has a hole.
+It applies to the Redis path. `packages/server/src/persistence/orderSink.ts` is
+the hook: replace the no-op with an `XADD` onto a Redis Stream, and write a
+worker that reads the stream and inserts into Postgres using the schema in
+`postgresStore.ts`.
 
 Keep it strictly off the hot path: the HTTP response is decided before the sink
 is called. If you are short on time, implement the enqueue and describe the
@@ -134,12 +167,15 @@ they are the likeliest interview questions:
 - **An API instance dies mid-request.** Nothing is lost: the reservation either
   committed atomically or did not happen. The client retries safely because
   `reserve` is keyed by user — a retry returns `already_purchased`.
-- **Redis dies.** AOF `everysec` (already in `docker-compose.yml`) bounds the
-  loss to ~1s of reservations. Add a replica for failover. On cold start,
+- **The database dies** (Postgres path). Nothing is oversold — no transaction
+  commits, so every request fails closed with a 503 and retries safely. Restore
+  is a normal restore; there is no divergent in-memory truth to reconcile.
+- **Redis dies** (Redis path). AOF `everysec` (already in `docker-compose.yml`)
+  bounds the loss to ~1s of reservations. Add a replica for failover. On cold start,
   rebuild stock from Postgres rather than re-seeding blindly — otherwise a
   restart refills the shelf and you oversell. This is why `init` must use
   `SET … NX`.
-- **The worker falls behind.** Users hold valid reservations that are not yet in
+- **The worker falls behind** (Redis path only). Users hold valid reservations that are not yet in
   Postgres. Acceptable: the queue drains. Add a reconciliation job that compares
   Redis order count against `SELECT count(*)` and alerts on drift.
 - **A node's clock is wrong.** The sale boundary is read from one server's
@@ -190,7 +226,8 @@ The README has the skeleton of this already; make the reasoning yours.
 - **"One per user" enforced in the frontend.** Disabling the button is UX. The
   only enforcement that counts is inside the atomic step.
 - **A queue in the diagram that does nothing.** Either wire it up or explain why
-  it is out of scope. An unexplained box reads as cargo cult.
+  it is out of scope. An unexplained box reads as cargo cult — and so does
+  Redis in front of a ten-unit sale with no measurement to justify it.
 - **Tests that only cover the happy path.** The interesting cases are the ones
   that must *fail*: second purchase, sold out, before the window, after it.
 - **Unexplained numbers.** "1844 req/s" alone means nothing. Say what was
