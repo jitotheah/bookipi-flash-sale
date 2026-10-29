@@ -35,10 +35,3 @@ CREATE TABLE IF NOT EXISTS purchases (
 -- Answers GET /api/purchase/:userId without scanning.
 CREATE INDEX IF NOT EXISTS purchases_user_idx ON purchases (sale_id, user_id);
 
--- -----------------------------------------------------------------------------
--- Seed. ON CONFLICT DO NOTHING matters: a deploy or restart MID-SALE must not
--- refill the shelf. Re-running this file is safe.
--- -----------------------------------------------------------------------------
-INSERT INTO sales (id, product_id, remaining_stock, total_stock, starts_at, ends_at)
-VALUES (1, 'iphone-17-pro', 10, 10, now(), now() + interval '1 hour')
-ON CONFLICT (id) DO NOTHING;

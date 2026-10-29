@@ -16,7 +16,7 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "stress": "node stress/run.mjs",
     "infra:up": "docker compose up -d",
-    "infra:down": "docker compose down -v"
+    "infra:down": "docker compose down"
   },
   "engines": {
     "node": ">=20"

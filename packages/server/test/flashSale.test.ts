@@ -89,6 +89,31 @@ describe('FlashSaleService', () => {
     expect((await service.getState()).status).toBe('sold_out');
   });
 
+  it('rejects a purchase exactly when the sale ends', async () => {
+    const startsAt = new Date('2026-11-01T10:00:00Z');
+    const endsAt = new Date('2026-11-01T11:00:00Z');
+
+    const store = new MemoryInventoryStore();
+    await store.init(10);
+
+    const service = new FlashSaleService({
+      store,
+      config: testConfig({
+        startsAt,
+        endsAt,
+        totalStock: 10,
+      }),
+      now: () => endsAt,
+    });
+
+    const result = await service.purchase('ada');
+
+    expect(result.outcome).toBe('sale_ended');
+    expect((await service.getState()).status).toBe('ended');
+    expect(await store.remaining()).toBe(10);
+    expect(await store.findOrder('ada')).toBeNull();
+  });
+
   it('rejects identifiers that cannot be a stable dedupe key', async () => {
     const { service } = await serviceWith(10);
     for (const bad of ['', '  ', 'ab', 'has space', 'x'.repeat(65), null, 42]) {

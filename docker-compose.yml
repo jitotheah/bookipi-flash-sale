@@ -6,10 +6,10 @@ services:
     image: redis:7-alpine
     # appendonly + everysec: at most ~1s of acknowledged reservations lost on a
     # hard crash. See GUIDE.md step 6 for why that is an acceptable trade.
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
-    ports: ["6379:6379"]
+    command: [ "redis-server", "--appendonly", "yes", "--appendfsync", "everysec" ]
+    ports: [ "6379:6379" ]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 2s
       timeout: 2s
       retries: 10
@@ -20,9 +20,14 @@ services:
       POSTGRES_USER: flash
       POSTGRES_PASSWORD: flash
       POSTGRES_DB: flashsale
-    ports: ["5432:5432"]
+    ports: [ "5432:5432" ]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U flash"]
+      test: [ "CMD-SHELL", "pg_isready -U flash" ]
       interval: 2s
       timeout: 2s
       retries: 10
+
+volumes:
+  postgres_data:

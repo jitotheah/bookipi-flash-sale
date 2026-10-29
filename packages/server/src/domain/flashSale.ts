@@ -84,7 +84,7 @@ export class FlashSaleService {
     if (now < this.#config.startsAt) {
       return { outcome: 'sale_not_started', order: null, message: 'The sale has not started yet.' };
     }
-    if (now > this.#config.endsAt) {
+    if (now >= this.#config.endsAt) {
       return { outcome: 'sale_ended', order: null, message: 'This sale has ended.' };
     }
 
@@ -93,15 +93,40 @@ export class FlashSaleService {
     switch (result.status) {
       case 'reserved':
         this.#sink.record(result.order);
-        return { outcome: 'purchased', order: result.order, message: 'Order confirmed.' };
+
+        return {
+          outcome: 'purchased',
+          order: result.order,
+          message: 'Order confirmed.',
+        };
+
       case 'duplicate':
         return {
           outcome: 'already_purchased',
           order: result.order,
           message: 'You already secured one. Limit is one per customer.',
         };
+
       case 'sold_out':
-        return { outcome: 'sold_out', order: null, message: 'This item is no longer available.' };
+        return {
+          outcome: 'sold_out',
+          order: null,
+          message: 'This item is no longer available.',
+        };
+
+      case 'sale_not_started':
+        return {
+          outcome: 'sale_not_started',
+          order: null,
+          message: 'The sale has not started yet.',
+        };
+
+      case 'sale_ended':
+        return {
+          outcome: 'sale_ended',
+          order: null,
+          message: 'This sale has ended.',
+        };
     }
   }
 
@@ -114,7 +139,7 @@ export class FlashSaleService {
 
   #statusAt(now: Date, remaining: number): SaleStatus {
     if (now < this.#config.startsAt) return 'upcoming';
-    if (now > this.#config.endsAt) return 'ended';
+    if (now >= this.#config.endsAt) return 'ended';
     return remaining > 0 ? 'active' : 'sold_out';
   }
 }
