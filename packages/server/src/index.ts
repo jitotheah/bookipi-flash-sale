@@ -17,12 +17,10 @@ await app.listen({ port: config.port, host: config.host });
 app.log.info(
   {
     product: config.product.name,
-    stock: config.totalStock,
+    saleId: config.saleId,
     driver: config.inventoryDriver,
-    startsAt: config.startsAt.toISOString(),
-    endsAt: config.endsAt.toISOString(),
   },
-  'flash sale ready',
+  'flash sale API ready',
 );
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {

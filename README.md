@@ -1,435 +1,369 @@
-# Booki Flash Sale
+# Bookipi Flash Sale
 
-A single-product flash sale: **10 units of an iPhone 17 Pro, one per customer,
-inside a fixed time window.**
+A TypeScript flash-sale application using Fastify, React/Vite and PostgreSQL.
+One product has configurable stock and a sale window. Each normalized user
+identifier can secure one item per sale.
 
-The interesting part of this problem is not the storefront — it is that
-thousands of people press *Buy Now* in the same second, and exactly ten of them
-may win. This repo is structured so that the concurrency decision is a single,
-reviewable seam rather than something smeared across the codebase.
+The PostgreSQL implementation persists purchases and stock, enforces the sale
+window with the database clock, and coordinates independent API processes.
+The frontend provides order lookup and recovery when a purchase response is
+lost. There is no payment processing or account authentication in this demo.
 
-> **Status: UI + scaffolding complete. Backend transaction not implemented.**
->
-> The React storefront, the typed API contract, the route skeletons, the store
-> interface and the proposed schema are done. `PostgresInventoryStore` is a
-> documented stub — writing it is the exercise. Unimplemented operations
-> report themselves as `501 not_implemented` rather than failing silently.
->
-> [`GUIDE.md`](./GUIDE.md) teaches it one step at a time.
+## Architecture
 
----
-
-## 1. System diagram
-
-```
-                      ┌──────────────────────────────┐
-                      │   React SPA (Vite)           │
-                      │   sale status · countdown    │
-                      │   Buy Now · result states    │
-                      └──────────────┬───────────────┘
-                                     │  HTTPS / JSON
-                                     ▼
-                      ┌──────────────────────────────┐
-                      │   CDN + Load balancer        │
-                      │   static assets, TLS,        │
-                      │   GET /api/sale cached ~1s   │ ◄── absorbs the read flood
-                      └──────────────┬───────────────┘
-                                     │
-                 ┌───────────────────┼───────────────────┐
-                 ▼                   ▼                   ▼
-        ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-        │ Fastify API #1 │  │ Fastify API #2 │  │ Fastify API #n │   stateless,
-        │ validate       │  │                │  │                │   scale out
-        │ check window   │  │                │  │                │   freely
-        └────────┬───────┘  └────────┬───────┘  └────────┬───────┘
-                 │                   │                   │
-                 └───────────────────┼───────────────────┘
-                                     │  ONE atomic command
-                                     ▼
-                      ╔══════════════════════════════╗
-                      ║  THE SERIALISATION POINT     ║
-                      ║  one atomic step, O(1):      ║
-                      ║   1. has this user bought?   ║
-                      ║   2. is stock > 0?           ║
-                      ║   3. decrement + record      ║
-                      ║                              ║
-                      ║  InventoryStore interface    ║
-                      ║  [built] memory (reference)  ║
-                      ║  [PLANNED] Postgres  ◄── you ║
-                      ╚══════════════┬═══════════════╝
-                                     │
-                                     ▼
-                      ┌──────────────────────────────┐
-                      │  PostgreSQL     [PLANNED]    │
-                      │  sales(remaining_stock, …)   │
-                      │  purchases UNIQUE(sale,user) │
-                      │                              │
-                      │  The transaction IS the      │
-                      │  durable business record —   │
-                      │  nothing downstream of it.   │
-                      └──────────────────────────────┘
-
-
-        ╌╌ optional extension, only if measurement justifies it ╌╌
-
-        Redis Lua script in place of the transaction, with the durable
-        record written off the hot path:
-            Redis ──► queue (Stream/SQS) ──► worker ──► PostgreSQL
-                                                     + reconciliation job
-        Buys ~100k ops/s and no pool to exhaust. Costs durability,
-        a worker, and a reconciliation job the Postgres path never needs.
+```mermaid
+flowchart TD
+    UI["React and Vite :5173"] -->|"Proxy /api"| Demo["Fastify :3000; demo sale 1"]
+    Load["Node HTTP load generator"] --> A["Fastify :3001; test sale"]
+    Load --> B["Fastify :3002; same test sale"]
+    Demo --> DB["PostgreSQL 16"]
+    A --> DB
+    B --> DB
 ```
 
-**Legend.** `[built]` ships in this repo. `[PLANNED]` is scaffolded with its
-contract written down and reports `501` until you implement it.
+This shows the local demo and the two-process test arrangement. PostgreSQL runs
+in Docker with a named data volume. The demo and load-test sale use separate
+rows, so the stress test does not consume the demo's inventory.
 
-### Why this shape
+Each API process uses a PostgreSQL pool with at most 10 connections. The API
+keeps no authoritative inventory in process memory in PostgreSQL mode. All
+instances serving a sale must share its `SALE_ID` and `DATABASE_URL`.
 
-**One serialisation point, as small as possible.** Overselling is only
-preventable if something, somewhere, orders the requests. The design makes that
-point explicit and makes the work it does O(1). Everything else — TLS, JSON
-parsing, validation, the time-window check — happens on stateless API nodes
-that scale horizontally.
+A production arrangement could place a load balancer in front of the APIs and
+serve the built React assets through a CDN. Neither service is deployed here.
+Redis, an asynchronous queue and a worker are optional extensions, not part of
+the implemented purchase path.
 
-**`GET /api/sale` is the real traffic.** 50k browsers polling every 2s is 25k
-req/s of pure reads against a single number. One cached response serving all of
-them is the difference between flat read load and a melted inventory store.
-This is true for every driver below.
+## Purchase transaction and correctness
 
----
+`packages/server/src/store/postgresStore.ts` contains the concurrency boundary.
+Every statement in a purchase transaction uses the same borrowed connection:
 
-## 2. Why PostgreSQL
+1. Begin a `READ COMMITTED` transaction and set local lock/statement timeouts.
+2. Lock the selected `sales` row using `SELECT ... FOR UPDATE`.
+3. Insert the proposed purchase with `ON CONFLICT (sale_id, user_id) DO NOTHING`.
+4. If that user already purchased, read their existing order, roll back the
+   transaction and return that order without decrementing stock.
+5. Otherwise, read a fresh `clock_timestamp()` after acquiring the sale lock.
+   Allow allocation only when `starts_at <= checked_at < ends_at` and stock
+   is positive.
+6. For an allowed allocation, decrement stock and commit the purchase and stock
+   change together. For a refusal, roll back the inserted purchase.
+7. Release the connection in `finally`; discard a connection detected as broken.
 
-`src/store/inventoryStore.ts` defines one contract — *the dedupe check, the
-stock check and the decrement are one indivisible step*. PostgreSQL is the
-recommended implementation of it; Redis is an optional extension, documented
-here so the trade-off is argued rather than assumed.
+Only one transaction can hold this sale's row lock at a time. Each later buyer
+checks the stock left by earlier committed transactions. PostgreSQL also enforces
+`CHECK (remaining_stock >= 0)` and `UNIQUE (sale_id, user_id)` as independent
+database constraints. The transaction connects the inventory change to the
+purchase record, avoiding orphan orders or consumed stock on a refused attempt.
 
-### The recommended path: one Postgres transaction
+Admission time is the database decision time after the lock is obtained, rather
+than the time the browser clicked or the transaction began. A request queued
+until after the sale ends is refused. A successful allocation can finish
+committing after the end time if its allocation decision was within the window.
 
-```sql
-BEGIN;
-  INSERT INTO purchases (order_id, sale_id, user_id) VALUES ($1, $2, $3)
-  ON CONFLICT (sale_id, user_id) DO NOTHING          -- zero rows = already bought
-  RETURNING order_id, created_at;
+Duplicate lookup precedes the window and stock decision. An existing buyer can
+recover their original order even when the sale is now ended or sold out.
 
-  UPDATE sales SET remaining_stock = remaining_stock - 1
-   WHERE id = $2 AND remaining_stock > 0
-     AND clock_timestamp() >= starts_at AND clock_timestamp() < ends_at
-  RETURNING remaining_stock;                          -- zero rows = refuse
-COMMIT;
+The setup script inserts a sale only when its ID does not exist. In PostgreSQL
+mode its saved window and inventory are authoritative. Restarting an API or
+rerunning setup preserves them; changing environment variables does not edit
+an existing sale.
+
+## Failure handling
+
+- Known transient database/connection errors return HTTP `503` with
+  `Retry-After: 1`. Unexpected server errors return a sanitized `500` response.
+  PostgreSQL failures never trigger an automatic switch to the memory driver.
+- A database error or browser timeout can occur after the transaction commits.
+  An error response therefore does not prove that no order exists. The UI asks
+  the buyer to check their order or retry with the same identifier.
+- A lookup showing no order may precede completion of an earlier in-flight
+  request. The uncertainty screen keeps lookup and retry available.
+- The live frontend bounds requests with an eight-second browser timeout.
+  That timeout cancels the browser's wait; it does not undo a database commit.
+- Transactions use a three-second lock timeout and a five-second statement
+  timeout. Pool acquisition uses a five-second connection timeout. These do
+  not constitute a deadline for the entire HTTP request.
+- Shutdown handlers call `app.close()` to drain requests and close the pool.
+  `/health` is a process liveness endpoint, not a database readiness check.
+- The Docker volume preserves PostgreSQL data across ordinary container
+  recreation. High availability, backups and recovery from host/disk loss are
+  outside this local implementation.
+
+## Requirements and installation
+
+- Node.js **22.x, version 22.12.0 or later**, and npm. Node.js 24.x is also
+  accepted by the locked Vite/Vitest dependencies.
+- Docker Desktop with its Linux engine running, and Docker Compose.
+
+Run commands from the repository root. The examples use PowerShell on Windows.
+Use separate terminals for the backend and frontend.
+
+```powershell
+npm ci
+docker compose up -d postgres
+docker compose exec postgres pg_isready -U flash -d flashsale
 ```
 
-This is safe, and the reason is worth stating precisely: under `READ COMMITTED`
-a blocked `UPDATE` **re-evaluates its `WHERE` clause against the row version
-written by the transaction it waited for** (EvalPlanQual), so `remaining_stock
-> 0` is tested *after* the wait. Under `REPEATABLE READ` the same statement
-raises a `40001` serialization failure instead and needs a bounded retry loop.
+Configuration is read from the process environment. The following commands set
+it explicitly; copying an environment example file alone does not load it.
 
-Three details that make or break it:
+### Backend: terminal 1
 
-- `ON CONFLICT`, not catching `23505` — a unique violation aborts the whole
-  transaction, so you could not then look up the original order to return.
-- `clock_timestamp()`, not `now()` — `now()` is transaction-*start* time, and
-  this statement may have blocked on the row lock. It also judges the window by
-  **one** clock however many API nodes exist, which is strictly better than
-  checking the window per-node as this skeleton currently does.
-- `INSERT` before `UPDATE` — shortens the time the contended `sales` row lock
-  is held.
+```powershell
+$env:INVENTORY_DRIVER = "postgres"
+$env:DATABASE_URL = "postgres://flash:flash@localhost:5432/flashsale"
+$env:SALE_ID = "1"
+$env:TOTAL_STOCK = "10"
+$env:PORT = "3000"
+$env:SALE_START_AT = [DateTime]::UtcNow.AddMinutes(-1).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+$env:SALE_END_AT = [DateTime]::UtcNow.AddHours(1).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 
-**Its real bottleneck is the connection pool, not the row lock.** Thousands of
-concurrent buyers against a pool of tens means requests queue *inside the API*:
-latency climbs, timeouts cascade, and the API falls over while Postgres sits
-there healthy. Mitigate with PgBouncer in transaction mode, short transactions,
-`lock_timeout` / `statement_timeout` so waiters fail fast, and a cached
-sold-out flag so the ~99% of losers never open a transaction at all.
+npm run db:setup --workspace=@flash/server
+npm run dev:server
+```
 
-### The optional extension: Redis
+On a fresh database, this creates sale 1 with 10 items and an active window.
+If sale 1 already exists, setup reports its saved settings. To create another
+demo sale, stop the backend, choose an unused `SALE_ID`, then run setup and
+restart in the same terminal. An existing ended/sold-out sale stays that way.
 
-Not required, and not a second backend to implement — `redisStore.ts` is a
-sketch kept for the comparison. A Lua script runs to completion with nothing
-interleaved, giving the same guarantee at ~100k ops/s with one network round
-trip and no connection pool to exhaust. The price: Redis is not durable by
-default, so the business record moves to an async worker and you now owe a
-reconciliation job, an AOF policy, and a cold-start rule that rebuilds stock
-from Postgres rather than re-seeding (otherwise a restart refills the shelf and
-you oversell). Worth building only to *measure* the difference.
+`npm run start --workspace=@flash/server` runs the backend without watch mode.
+The server executes TypeScript with `tsx`; there is no separate backend emit
+step. Verify its types with `npm run typecheck`.
 
-### The honest verdict
+### Frontend: terminal 2
 
-For **10 units and a one-hour window, Postgres alone is the right answer** —
-one system, one source of truth, no eventual consistency to explain, and the
-unique index is an independent guarantee of one-per-user that no application
-bug can defeat. Redis earns its place when sustained write throughput on the
-contended row becomes the limit, not before; reaching for it at this scale is
-the kind of unjustified complexity the brief calls out.
+```powershell
+npm run dev:web
+```
 
-Both sit behind the same interface, so if you do build the extension the choice
-is a config change and the same contract tests run against either — which turns
-the trade-off from an assertion into a measurement.
+Open the [live storefront](http://localhost:5173/?api=live). Vite forwards `/api`
+requests to port 3000.
+Enter an identifier and purchase, then use the same identifier to recover the
+existing order. Identifiers are trimmed, lowercased, and restricted to 3–64
+letters, digits or `. _ - + @` characters.
 
-### Trade-offs taken deliberately
+An isolated UI preview is available at:
 
-| Decision | Bought | Paid |
+- [Active sale](http://localhost:5173/?api=mock&mock=active)
+- [Upcoming sale](http://localhost:5173/?api=mock&mock=upcoming)
+- [Sold out](http://localhost:5173/?api=mock&mock=sold_out)
+- [Ended sale](http://localhost:5173/?api=mock&mock=ended)
+- [Uncertain purchase](http://localhost:5173/?api=mock&mock=uncertain)
+
+Mock mode is labeled, stores simulated data in the browser tab, and consumes no
+PostgreSQL stock. It is not a concurrency or persistence test.
+
+Build the static frontend with:
+
+```powershell
+npm run build --workspace=@flash/web
+```
+
+The output is `packages/web/dist`. Production hosting must route `/api` to the
+backend; the Vite development proxy is not a deployed load balancer.
+
+### Configuration
+
+| Variable | Default | Meaning |
 |---|---|---|
-| One pluggable serialisation point | Concurrency lives in one reviewable file; drivers are swappable | A layer of indirection over "just call the DB" |
-| Postgres as the recommended driver | Durable, one system, no reconciliation | Throughput capped by pool then row-lock; needs load shedding |
-| Redis left as an optional extension | No unjustified complexity for 10 units | Row-lock ceiling stays until someone measures it |
-| Memory driver kept as a reference | Executable definition of correct; tests run with nothing installed | One more driver to explain; must never be a production fallback |
-| Mock adapter in the frontend | UI reviewable with no backend at all | Must be labelled on screen or it becomes a lie |
-| Time window checked in the API | Pre-sale flood rejected without an inventory round-trip | N nodes means N clocks; the Postgres driver fixes this with `clock_timestamp()` |
-| `remainingStock` exposed in the sale response | Honest, motivating UI | Cache-busting if served uncached; it is advisory only |
-| User identifier typed by the shopper | Matches the brief, demoable | Trivially bypassed — production must key on an authenticated account |
+| `INVENTORY_DRIVER` | `memory` | Set `postgres` for the durable implementation. `redis` is a stub. |
+| `DATABASE_URL` | `postgres://flash:flash@localhost:5432/flashsale` | Shared PostgreSQL database. |
+| `SALE_ID` | `1` | Sale row selected by setup, API and inventory inspection. |
+| `TOTAL_STOCK` | `10` | Initial inventory when creating a new sale. |
+| `SALE_START_AT` | Configuration load time | Initial window start for a new sale. |
+| `SALE_END_AT` | Start plus one hour | Initial exclusive end for a new sale. |
+| `PORT` | `3000` | API listening port. |
+| `HOST` | `0.0.0.0` | API listening interface. |
+| `LOG_LEVEL` | `info` | Set `warn` to reduce per-request console logging during load tests. |
 
-## 3. Implemented vs planned
+In PostgreSQL mode, saved sale settings take precedence over initial stock and
+window variables. Product metadata is defined in `packages/server/src/config.ts`.
 
-Everything marked **planned** is scaffolded with its contract written down and
-nothing faked: a stub reports `501 not_implemented`, it does not return a
-plausible-looking answer.
+## Tests
 
-### Implemented
+```powershell
+npm test
+npm run typecheck
+npm run db:check --workspace=@flash/server
+npm run test:db --workspace=@flash/server
+```
 
-| | |
+- `npm test`: 21 tests in four files, covering memory/service behavior,
+  Fastify routes, persisted-sale metadata through a test double, and simulated
+  database/response failures. Fastify injection exercises routing without
+  listening on a socket. These tests do not require PostgreSQL.
+- `db:check`: reads the configured PostgreSQL sale and an example user's order.
+- `test:db`: exercises actual PostgreSQL using two independent store/pool
+  instances and an isolated sale fixture. It verifies duplicate recovery,
+  concurrent allocation, window/sold-out refusal without leftover orders, and
+  purchase/distinct-user counts. It removes its own fixture afterward.
+- The HTTP stress test below exercises two actual listening API processes.
+
+Start PostgreSQL and run database setup before the database checks. The fixture
+script does not truncate tables or reset the demo sale.
+
+## Repeatable two-process HTTP stress test
+
+Choose a sale ID not used by an earlier run. This example uses **7001**.
+All purchase traffic during the test must come from the generator. Keep the
+port-3000 demo on its own sale.
+
+### Test API 1: separate terminal
+
+```powershell
+$env:INVENTORY_DRIVER = "postgres"
+$env:DATABASE_URL = "postgres://flash:flash@localhost:5432/flashsale"
+$env:SALE_ID = "7001"
+$env:TOTAL_STOCK = "10"
+$env:PORT = "3001"
+$env:LOG_LEVEL = "warn"
+$env:SALE_START_AT = [DateTime]::UtcNow.AddMinutes(-1).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+$env:SALE_END_AT = [DateTime]::UtcNow.AddHours(1).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+
+npm run db:setup --workspace=@flash/server
+```
+
+Confirm that setup created sale 7001 with 10 remaining items, then run:
+
+```powershell
+npm run start --workspace=@flash/server
+```
+
+### Test API 2: another terminal
+
+```powershell
+$env:INVENTORY_DRIVER = "postgres"
+$env:DATABASE_URL = "postgres://flash:flash@localhost:5432/flashsale"
+$env:SALE_ID = "7001"
+$env:PORT = "3002"
+$env:LOG_LEVEL = "warn"
+
+npm run start --workspace=@flash/server
+```
+
+### Generator: another terminal
+
+```powershell
+npm run stress -- --url http://localhost:3001,http://localhost:3002 --users 2000 --duplicates 20 --concurrency 100
+```
+
+The dependency-free Node generator first sends 20 attempts from the same user,
+then 2,000 distinct-user attempts, using unique identifiers for each run.
+It distributes requests across the supplied API origins. It bounds requests
+with ten-second timeouts and verifies HTTP status/outcome combinations.
+
+Expect 2,020 purchase responses: **10 purchased, 19 already_purchased, and
+1,991 sold_out**. All six assertions should pass:
+
+1. The repeated user gets one purchase and the same order on every retry.
+2. Exactly 10 purchases succeed across both APIs.
+3. Winners have distinct users and order IDs.
+4. All purchase requests have the expected HTTP status and outcome.
+5. Both APIs report zero remaining stock.
+6. Every winning order is retrievable with the same ID from both APIs.
+
+The generator exits nonzero on failure. It requires fresh stock and refuses to
+treat a reused, exhausted sale as a fresh test. For another run, stop both test
+APIs, select another unused sale ID in both terminals, create it, and restart.
+The script supports a single API too: supply one origin to `--url`.
+
+Check the database independently, using this run's sale ID:
+
+```powershell
+docker compose exec postgres psql -U flash -d flashsale -c "SELECT s.id, s.total_stock, s.remaining_stock, count(p.order_id) AS purchases, count(DISTINCT p.user_id) AS unique_buyers FROM sales s LEFT JOIN purchases p ON p.sale_id = s.id WHERE s.id = 7001 GROUP BY s.id;"
+```
+
+Expected: total stock 10, remaining stock 0, purchases 10, unique buyers 10.
+
+### Observed local results
+
+The developer ran these checks on 29 October 2026 on a local Windows desktop,
+with PostgreSQL in Docker and the APIs and generator on the same computer:
+
+| Run | APIs | Purchase requests | Max in flight | Duration | Requests/s | p50 | p95 | p99 | Max latency |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Small baseline | 1 | 120 | 20 | 0.62 s | 194 | 78.7 ms | 168.3 ms | 182.6 ms | 185.8 ms |
+| Shared-sale run | 2 | 2,020 | 100 | 9.41 s | 215 | 433.5 ms | 608.6 ms | 640.1 ms | 678.1 ms |
+
+All six assertions passed in the shared-sale run. A separate SQL query for sale
+2026102902 confirmed 10 total stock, 0 remaining stock, 10 purchases and 10
+distinct buyers. The 21 automated tests also passed.
+
+These are correctness checks under a bounded workload, not a server capacity
+claim. The large run has 2,000 distinct-user attempts and at most 100 requests
+in flight, rather than 2,000 simultaneous requests. Only 10 purchases allocate
+stock; most responses are refusals. Reported throughput and latency cover the
+purchase phases, excluding the final status and order-lookup checks. The two
+runs use different concurrency and request counts, so they do not establish a
+scaling speedup. Runtime/hardware details and logging settings were not recorded
+with the results. A capacity study would record these, use a separate generator,
+mix reads with writes, and measure sustained successful allocation and overload.
+
+## API
+
+| Method | Path | Response |
+|---|---|---|
+| `GET` | `/api/sale` | Sale status, product, saved window, stock and database time in PostgreSQL mode. |
+| `POST` | `/api/purchase` | JSON body `{ "userId": "ada@example.com" }`. |
+| `GET` | `/api/purchase/:userId` | `hasPurchased` and the saved order, if present. |
+| `GET` | `/health` | Process liveness. |
+
+Purchase outcomes: `201 purchased`, `200 already_purchased`,
+`409 sold_out` / `sale_not_started` / `sale_ended`, and `400 invalid_user`.
+Transient service failures return `503`; unexpected failures return `500`.
+The unimplemented Redis driver returns `501 not_implemented`.
+
+Inventory in a status response is advisory: another request may buy the last
+item before the browser renders it. Only the purchase transaction allocates
+stock. Order lookup and retry use the normalized user ID and selected sale;
+clients must keep that identifier when recovering an uncertain request.
+
+## Trade-offs and limits
+
+- **One database as authority.** PostgreSQL atomically saves both the order and
+  inventory change. This avoids a Redis/database dual-write problem and a queue
+  recovery protocol for this scope.
+- **One hot sale row.** Serializing on it makes correctness easy to inspect,
+  but caps write throughput. Every purchase attempt, including a sold-out
+  refusal, currently acquires that lock. More API processes do not remove this
+  database serialization point.
+- **Finite pool, limited overload controls.** Each API pool has 10 connections;
+  waiting requests still consume resources. Timeout controls are implemented,
+  but a bounded admission queue, rate limiting and per-user abuse protection
+  are future work. Pool size alone does not bound the HTTP request backlog.
+- **Uncached reads.** The storefront polls status; no shared status cache or CDN
+  cache is implemented. A short-lived advisory status cache could reduce read
+  pressure. Purchase and order-recovery decisions must stay authoritative.
+- **Demo identifiers.** One-per-user means one per normalized supplied ID. A
+  person can enter another ID. Production must derive this key from an
+  authenticated account and protect order lookup appropriately.
+- **Optional drivers.** Memory is useful for tests and single-process demos;
+  it loses state on restart and does not coordinate processes. Redis remains a
+  documented stub; a durable Redis reservation pipeline would require a
+  persistence, failover and reconciliation design before claiming equivalent
+  guarantees.
+- **Scope.** Payments, cancellations, refunds, reservations with expiry, and
+  automated production deployment are not implemented.
+
+## Repository layout
+
+| Path | Responsibility |
 |---|---|
-| React storefront, all 8 UI states | sign-in, upcoming, active, purchasing, purchased, sold out, ended, uncertainty/error |
-| Mock adapter (labelled on screen) | lets the UI run and be reviewed with no backend at all |
-| Typed API contract | `packages/shared` — one breaking change fails typecheck on both sides |
-| Route skeletons | `GET /api/sale`, `POST /api/purchase`, `GET /api/purchase/:userId`, `/health` |
-| Domain rules | sale window, one-per-user, limited stock, outcome → HTTP mapping |
-| Store interface | `InventoryStore` — the single concurrency boundary |
-| Memory driver (**reference only**) | defines correct behaviour for the tests; not a deliverable |
-| 12 unit + integration tests | including a 500-caller oversell test and a 501 test |
-| Load generator | asserts no-oversell and one-per-user; a starting point, not a finished suite |
-| Proposed schema | `packages/server/db/schema.sql` — written, not yet applied by code |
+| `packages/shared/src/index.ts` | Shared API types. |
+| `packages/server/src/config.ts` | Environment parsing and product configuration. |
+| `packages/server/src/app.ts` | Fastify assembly, routes and error handling. |
+| `packages/server/src/domain/flashSale.ts` | Identifier normalization and outcome mapping. |
+| `packages/server/src/store/inventoryStore.ts` | Reservation and inventory contract. |
+| `packages/server/src/store/postgresStore.ts` | Persisted reads and atomic purchase transaction. |
+| `packages/server/src/store/memoryStore.ts` | Single-process reference store. |
+| `packages/server/src/scripts/` | Schema setup and PostgreSQL checks. |
+| `packages/server/db/schema.sql` | Tables and database constraints. |
+| `packages/server/test/` | Vitest service/API/failure tests. |
+| `packages/web/src/` | React UI, live API client and labeled mock preview. |
+| `stress/run.mjs` | HTTP load generator and correctness assertions. |
 
-### Planned
-
-| | Where | Guide |
-|---|---|---|
-| **The purchase transaction** | `store/postgresStore.ts` | step 4 ⭐ |
-| Outcome classification (sold out vs. not started vs. ended) | same file | step 5 |
-| Response caching + rate limiting | `routes/sale.ts`, `app.ts` | step 6 |
-| Failure-mode write-up | `README.md` | step 7 |
-| Full stress-test suite (k6, remote generator, failure runs) | `stress/` | step 8 |
-| *Optional:* Redis driver, queue worker | `store/redisStore.ts`, `persistence/` | optional |
-
----
-
-## 4. The four transaction requirements
-
-These are the acceptance criteria for `postgresStore.ts`, and the test
-checklist below mirrors them one for one.
-
-| | Requirement | Enforced by |
-|---|---|---|
-| **R1** | The sale window is enforced **on the server** | `clock_timestamp() >= starts_at AND < ends_at` inside the `UPDATE` predicate — not `now()` (transaction-start time), and not the client |
-| **R2** | Stock can **never** go negative | `remaining_stock > 0` in the predicate **and** `CHECK (remaining_stock >= 0)` on the column — mechanism plus proof |
-| **R3** | One purchase per user | `UNIQUE (sale_id, user_id)` — a constraint, so it holds even if the reservation logic has a race |
-| **R4** | A failed or duplicate purchase **never consumes stock** | On duplicate, stop before the decrement; on refusal, `ROLLBACK` so neither the insert nor the decrement survives |
-
-R4 is the one most often got wrong. The `INSERT … ON CONFLICT DO NOTHING`
-returning zero rows means the user already owns a unit — the decrement must not
-run at all.
-
-Why the conditional `UPDATE` cannot oversell: under `READ COMMITTED` a blocked
-`UPDATE` re-evaluates its `WHERE` clause against the row version written by the
-transaction it waited for (EvalPlanQual), so `remaining_stock > 0` is tested
-*after* the wait. Under `REPEATABLE READ` it raises `40001` instead and needs a
-bounded retry loop.
-
----
-
-## 5. Test checklist
-
-Implemented tests are ticked. The rest are what "done" looks like.
-
-**Concurrency — the invariants (R2, R3, R4)**
-- [x] 500 concurrent buyers against 10 units → exactly 10 winners
-- [x] 50 concurrent attempts from one user → 1 winner, stock down by 1
-- [ ] Same two tests against Postgres, via a shared contract-test function
-- [ ] A duplicate purchase leaves `remaining_stock` unchanged (R4)
-- [ ] A rolled-back transaction leaves no orphan `purchases` row (R4)
-- [ ] Two API instances, one database → still exactly 10
-
-**Sale window (R1)**
-- [x] Purchase before `starts_at` → `sale_not_started`, stock untouched
-- [x] Purchase after `ends_at` → `sale_ended`, stock untouched
-- [ ] The window is judged by the database clock, not the API node's
-- [ ] A request arriving one millisecond past `ends_at`
-
-**API surface**
-- [x] `201` first purchase, `200` repeat, `409` sold out, `400` bad identifier
-- [x] Stub drivers answer `501 not_implemented` and still boot
-- [x] `GET /api/purchase/:userId` reports held units
-- [ ] `503` when the database is unreachable — fail closed, never a sale
-
-**Load**
-- [x] Invariants hold with every request in flight at once
-- [ ] Generator on separate hardware from the API
-- [ ] Degradation point identified and named (expect pool saturation)
-- [ ] An instance killed mid-run; invariants still hold
-
----
-
-## 6. Running it
-
-### The UI alone — no backend required
-
-```bash
-npm install
-npm run dev:web        # http://localhost:5173
-```
-
-The frontend defaults to a **mock adapter**: simulated data, in your browser
-tab, nothing persisted. A labelled banner says so on every screen — simulated
-data must never be mistakable for real data.
-
-Every UI state is reachable with `?mock=<scenario>`:
-
-| Scenario | Shows |
-|---|---|
-| `active` *(default)* | open sale, 10 units |
-| `upcoming` | starts in two minutes, countdown running |
-| `ended` | closed an hour ago |
-| `sold_out` | open, zero stock |
-| `last_one` | one unit left — race two tabs against it |
-| `slow` | 2.5s purchases, to sit in the purchasing state |
-| `uncertain` | transport failure, outcome unknown → "Check my order" |
-| `unimplemented` | what a `501` stub driver looks like |
-
-```
-http://localhost:5173/?mock=sold_out
-```
-
-### Against the real API
-
-```bash
-npm run dev:server                              # :3000, memory driver
-open 'http://localhost:5173/?api=live'          # or VITE_API_MODE=live
-```
-
-The memory driver is a **reference implementation for the tests**, not a
-deliverable — it cannot survive a restart or more than one process. Point the
-UI at `INVENTORY_DRIVER=postgres` once you have written step 4; until then it
-answers `501` and the UI says which step is missing.
-
-Configuration (see `.env.example`): `TOTAL_STOCK` (default 10), `SALE_START_AT`
-/ `SALE_END_AT` (default: starts at boot, runs one hour), `INVENTORY_DRIVER`
-(`memory` | `postgres` | `redis`), `DATABASE_URL`, `PORT`, `LOG_LEVEL`.
-
-```bash
-SALE_START_AT=2027-01-01T00:00:00Z npm run dev:server   # a sale not yet open
-TOTAL_STOCK=1 npm run dev:server                        # sold out after one
-INVENTORY_DRIVER=postgres npm run dev:server            # boots, answers 501
-```
-
-### Tests
-
-```bash
-npm test          # vitest: 12 unit + integration tests
-npm run typecheck # tsc across all three packages
-```
-
-### Stress test
-
-```bash
-# terminal 1 — fresh stock, quiet logs
-LOG_LEVEL=warn TOTAL_STOCK=10 npm run dev:server
-
-# terminal 2
-npm run stress -- --users 3000 --duplicates 50 --concurrency 300
-```
-
-Expected output — the assertions are the point, not the throughput number:
-
-```
-  outcomes
-    sold_out             3040
-    purchased            10
-
-  throughput    1844 req/s over 1.65s
-  latency       p50 148.4ms  p95 306.2ms  p99 381.8ms  max 457.0ms
-
-  assertions
-    PASS  exactly 10 units sold (no oversell, no undersell)  (sold 10)
-    PASS  every winner is a distinct user  (10 unique of 10)
-    PASS  no request failed at the transport layer  (0 failures)
-    PASS  stock reads zero afterwards  (checked via GET /api/sale)
-```
-
-3050 requests, 10 winners, all distinct — including the cohort where one user
-fires 50 concurrent attempts. The script exits non-zero if any assertion fails,
-so it works as a CI gate.
-
-Reading the numbers honestly: the latency above is dominated by the load
-generator and the API sharing one machine, and 1.8k req/s is the *client's*
-ceiling here, not the server's. The number that matters is that the invariants
-held while every request was in flight at once. Measuring the server's real
-ceiling needs the generator on separate hardware — GUIDE.md step 8, which also
-covers the ramping profile, the failure run and the results table this section
-still owes.
-
-Note what this run does *not* prove: it exercises the memory driver, which is
-one process. The interesting version is the same script against two API
-instances sharing one Postgres — that is step 4's acceptance criterion.
-
----
-
-## 7. API
-
-| Method | Path | Returns |
-|---|---|---|
-| `GET` | `/api/sale` | status (`upcoming` / `active` / `sold_out` / `ended`), product, window, stock, server clock |
-| `POST` | `/api/purchase` | `201 purchased` · `200 already_purchased` · `409 sold_out` / `sale_not_started` / `sale_ended` · `400 invalid_user` |
-| `GET` | `/api/purchase/:userId` | whether that user holds a unit, and their order |
-| `GET` | `/health` | liveness |
-
-`200` for a repeat purchase is deliberate: the user *does* hold a unit, so a
-retry is a successful idempotent replay, not an error. `serverTime` lets the
-browser run its countdown off the server's clock rather than the laptop's.
-
-Two failure codes are distinct on purpose: **`501 not_implemented`** means the
-driver behind that endpoint is still a stub, **`500`** means something broke.
-The UI renders them differently — "not written yet" and "crashed" are different
-facts. A stub never invents a plausible answer.
-
-A purchase that errors is a purchase the server did not commit, so a retry is
-safe. But the *client* cannot tell a dropped connection from a lost response,
-so the UI never claims it was not charged: it moves to an uncertainty state and
-resolves it with `GET /api/purchase/:userId`, which is authoritative and free
-to call.
-
----
-
-## 8. Layout
-
-```
-packages/shared   API contract shared by both sides — one breaking change
-                  fails typecheck on the server AND the browser
-packages/server   Fastify API
-  src/config.ts        all env parsing, in one place
-  src/errors.ts        NotImplementedError → 501
-  src/domain/          business rules, no HTTP
-  src/store/           ◄── the concurrency boundary
-    inventoryStore.ts    the contract
-    memoryStore.ts       reference implementation (tests only)
-    postgresStore.ts     ◄── PLANNED: you write this
-    redisStore.ts        optional extension, sketch only
-  src/routes/          outcome → status code
-  src/persistence/     durable-write hook (Redis path only)
-  db/schema.sql        proposed schema — not yet applied by code
-  test/                unit + integration
-packages/web      React storefront
-  src/lib/api.ts       adapter switch (mock | live)
-  src/lib/mockApi.ts   labelled simulation, for building the UI
-  src/lib/httpApi.ts   the real client
-  src/components/      one component per UI state
-stress/run.mjs    load generator with correctness assertions
-```
-
-The whole design rests on one interface, `src/store/inventoryStore.ts`: *the
-dedupe check, the stock check and the decrement are one indivisible step.* The
-memory driver gets that from Node's single thread, the Postgres driver from a
-transaction plus a unique index, the Redis driver from a Lua script. All three
-are held to the same contract, so swapping them is a config change — and the
-same tests prove all three.
+Stop local infrastructure with `docker compose down`. The named PostgreSQL
+volume remains; `docker compose down -v` deletes it and its saved orders.
