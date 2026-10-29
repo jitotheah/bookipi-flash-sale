@@ -4,6 +4,7 @@ export type InventoryDriver = 'memory' | 'postgres' | 'redis';
 
 export interface SaleConfig {
   product: Product;
+  saleId: number;
   startsAt: Date;
   endsAt: Date;
   totalStock: number;
@@ -67,6 +68,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SaleConfig {
 
   return {
     product: PRODUCT,
+    saleId: parseInteger(env.SALE_ID, 1),
     startsAt,
     endsAt,
     totalStock: parseInteger(env.TOTAL_STOCK, 10),

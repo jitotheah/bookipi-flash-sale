@@ -1,152 +1,174 @@
 #!/usr/bin/env node
 /**
- * Dependency-free load generator: `npm run stress`.
+ * Correctness test over real HTTP. Use a fresh, active PostgreSQL test sale.
+ * All target APIs must serve the SAME sale. Run no other buyers during the test.
  *
- * It is deliberately not a throughput benchmark -- it is a correctness test run
- * under load. The two invariants it asserts are the ones the whole design
- * exists to protect:
+ * npm run stress -- --url http://localhost:3001,http://localhost:3002 --users 2000 --duplicates 20 --concurrency 100
  *
- *   1. winners === totalStock          (no overselling, no undersell)
- *   2. every winner is a distinct user (one item per user)
- *
- * A throughput number that comes with a broken invariant is worthless, so the
- * script exits non-zero when either assertion fails.
- *
- * Usage:
- *   node stress/run.mjs --users 5000 --duplicates 40 --url http://localhost:3000
+ * First race one user against themselves, then race distinct users for the rest.
+ * The printed rate describes this short workload, mostly sold-out responses.
  */
+import { randomUUID } from 'node:crypto';
 
-const args = Object.fromEntries(
-  process.argv.slice(2).reduce((pairs, token, i, all) => {
-    if (token.startsWith('--')) pairs.push([token.slice(2), all[i + 1]]);
-    return pairs;
-  }, []),
-);
-
-const BASE = args.url ?? 'http://localhost:3000';
-const USERS = Number(args.users ?? 2000);
-const DUPLICATES = Number(args.duplicates ?? 50);
-const CONCURRENCY = Number(args.concurrency ?? 500);
-
-const percentile = (sorted, p) =>
-  sorted.length === 0 ? 0 : sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
-
-async function purchase(userId) {
-  const startedAt = performance.now();
-  try {
-    const response = await fetch(`${BASE}/api/purchase`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ userId }),
-    });
-    const body = await response.json();
-    return { userId, outcome: body.outcome ?? 'error', ms: performance.now() - startedAt };
-  } catch (error) {
-    return { userId, outcome: 'network_error', ms: performance.now() - startedAt, error };
+function options() {
+  const result = {};
+  const tokens = process.argv.slice(2);
+  const allowed = new Set(['url', 'users', 'duplicates', 'concurrency']);
+  for (let i = 0; i < tokens.length; i += 2) {
+    const key = tokens[i]?.slice(2);
+    const value = tokens[i + 1];
+    if (!tokens[i]?.startsWith('--') || !allowed.has(key) || !value || value.startsWith('--')) {
+      throw new Error(`Expected --url, --users, --duplicates or --concurrency followed by a value; received ${tokens[i]}.`);
+    }
+    result[key] = value;
   }
+  return result;
 }
 
-/** Runs every job with a bounded number in flight, so we load the server, not the client. */
-async function runPool(jobs, limit) {
-  const results = [];
-  let cursor = 0;
-  const workers = Array.from({ length: Math.min(limit, jobs.length) }, async () => {
-    while (cursor < jobs.length) {
-      const index = cursor++;
-      results.push(await jobs[index]());
-    }
+function integer(value, fallback, minimum, name) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum) {
+    throw new Error(`${name} must be an integer of at least ${minimum}.`);
+  }
+  return parsed;
+}
+
+function requireCheck(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+async function json(base, path, options = {}) {
+  const response = await fetch(`${base}${path}`, {
+    ...options,
+    signal: AbortSignal.timeout(10_000),
   });
-  await Promise.all(workers);
+  return { status: response.status, body: await response.json() };
+}
+
+async function read(base, path) {
+  const result = await json(base, path);
+  requireCheck(result.status === 200, `GET ${base}${path} returned HTTP ${result.status}.`);
+  return result.body;
+}
+
+async function runPool(jobs, concurrency) {
+  let cursor = 0;
+  const results = [];
+  await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, async () => {
+    while (cursor < jobs.length) {
+      const job = jobs[cursor++];
+      results.push(await job());
+    }
+  }));
   return results;
 }
 
-const sale = await fetch(`${BASE}/api/sale`).then((r) => r.json());
-console.log(
-  `\n  target        ${BASE}\n` +
-    `  product       ${sale.product.name}\n` +
-    `  sale status   ${sale.status}\n` +
-    `  stock         ${sale.remainingStock} / ${sale.totalStock} remaining\n` +
-    `  load          ${USERS} unique users + ${DUPLICATES} retries from one user\n` +
-    `  concurrency   ${CONCURRENCY} in flight\n`,
-);
+async function main() {
+  const args = options();
+  const targets = [...new Set((args.url ?? 'http://localhost:3000').split(',').map((value) => {
+    const url = new URL(value.trim());
+    requireCheck(
+      ['http:', 'https:'].includes(url.protocol) && url.pathname === '/' && !url.search && !url.hash,
+      'Each target must be an HTTP origin such as http://localhost:3001.',
+    );
+    return url.origin;
+  }))];
+  const users = integer(args.users, 2000, 1, '--users');
+  const duplicates = integer(args.duplicates, 20, 2, '--duplicates');
+  const concurrency = integer(args.concurrency, 100, 1, '--concurrency');
+  const before = await Promise.all(targets.map((base) => read(base, '/api/sale')));
+  const sale = before[0];
 
-if (sale.status !== 'active') {
-  console.error(`  Sale is "${sale.status}" — restart the server to open a fresh window.\n`);
-  process.exit(1);
+  for (const [index, state] of before.entries()) {
+    requireCheck(state.status === 'active', `${targets[index]} is ${state.status}. Create a fresh active test sale.`);
+    requireCheck(
+      Number.isSafeInteger(state.totalStock) && state.totalStock > 0 && state.remainingStock === state.totalStock,
+      `${targets[index]} needs untouched stock. Create a new SALE_ID; restarting the API does not reset stock.`,
+    );
+    requireCheck(
+      state.product?.id === sale.product?.id && state.totalStock === sale.totalStock &&
+        state.startsAt === sale.startsAt && state.endsAt === sale.endsAt,
+      'The APIs report different sale settings. Start both with the same SALE_ID and DATABASE_URL.',
+    );
+  }
+  requireCheck(users >= sale.totalStock - 1, 'Supply enough distinct users to exhaust the test stock.');
+
+  const prefix = `load-${randomUUID().slice(0, 8)}`;
+  const repeatUser = `${prefix}-repeat`;
+  let nextTarget = 0;
+  const expectedStatus = { purchased: 201, already_purchased: 200, sold_out: 409 };
+
+  async function purchase(userId) {
+    const base = targets[nextTarget++ % targets.length];
+    const startedAt = performance.now();
+    try {
+      const { status, body } = await json(base, '/api/purchase', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ userId }),
+      });
+      requireCheck(
+        Object.hasOwn(expectedStatus, body?.outcome) && expectedStatus[body.outcome] === status,
+        `Unexpected HTTP ${status}: ${body?.outcome ?? 'missing outcome'}.`,
+      );
+      if (body.outcome !== 'sold_out') {
+        requireCheck(typeof body.order?.orderId === 'string' && body.order.userId === userId, 'Missing or incorrect order.');
+      }
+      return { base, userId, outcome: body.outcome, orderId: body.order?.orderId, ms: performance.now() - startedAt };
+    } catch (error) {
+      return { base, userId, outcome: 'request_error', error: String(error), ms: performance.now() - startedAt };
+    }
+  }
+
+  console.log(`\n  targets       ${targets.join(', ')}\n  product       ${sale.product.name}\n  stock         ${sale.totalStock} untouched units\n  load          ${duplicates} attempts by one user, then ${users} distinct users\n  concurrency   up to ${concurrency} in flight\n`);
+
+  const startedAt = performance.now();
+  const repeated = await runPool(Array.from({ length: duplicates }, () => () => purchase(repeatUser)), concurrency);
+  const distinct = await runPool(Array.from({ length: users }, (_, i) => () => purchase(`${prefix}-${i}`)), concurrency);
+  const wallMs = performance.now() - startedAt;
+  const results = [...repeated, ...distinct];
+  const winners = results.filter((result) => result.outcome === 'purchased');
+  const repeatWinner = repeated.find((result) => result.outcome === 'purchased');
+  const failures = results.filter((result) => result.outcome === 'request_error');
+  const counts = new Map();
+  for (const result of results) counts.set(result.outcome, (counts.get(result.outcome) ?? 0) + 1);
+
+  console.log('  outcomes');
+  for (const [outcome, count] of counts) console.log(`    ${outcome.padEnd(20)} ${count}`);
+  console.log('\n  requests per API');
+  for (const base of targets) console.log(`    ${base}  ${results.filter((result) => result.base === base).length}`);
+
+  const latencies = results.map((result) => result.ms).sort((a, b) => a - b);
+  const percentile = (p) => latencies[Math.ceil(latencies.length * p) - 1].toFixed(1);
+  console.log(`\n  throughput    ${(results.length / (wallMs / 1000)).toFixed(0)} req/s over ${(wallMs / 1000).toFixed(2)}s\n  latency       p50 ${percentile(0.5)}ms  p95 ${percentile(0.95)}ms  p99 ${percentile(0.99)}ms  max ${latencies.at(-1).toFixed(1)}ms\n`);
+
+  const after = await Promise.all(targets.map((base) => read(base, '/api/sale')));
+  const lookups = await runPool(winners.flatMap((winner) => targets.map((base) => async () => {
+    const body = await read(base, `/api/purchase/${encodeURIComponent(winner.userId)}`);
+    return body.hasPurchased === true && body.order?.orderId === winner.orderId && body.order?.userId === winner.userId;
+  })), 10);
+
+  const checks = [
+    [
+      'one repeated user received one purchase and the same order on every retry',
+      repeated.filter((result) => result.outcome === 'purchased').length === 1 &&
+        repeated.filter((result) => result.outcome === 'already_purchased').length === duplicates - 1 &&
+        repeated.every((result) => result.orderId === repeatWinner?.orderId),
+    ],
+    [`exactly ${sale.totalStock} units sold across all APIs`, winners.length === sale.totalStock],
+    ['every winner has a distinct user and order', new Set(winners.map((result) => result.userId)).size === winners.length && new Set(winners.map((result) => result.orderId)).size === winners.length],
+    ['all HTTP requests returned the expected status and outcome', failures.length === 0],
+    ['every API reports zero remaining stock', after.every((state) => state.remainingStock === 0)],
+    ['every winning order can be retrieved with the same ID from every API', winners.length > 0 && lookups.every(Boolean)],
+  ];
+  console.log('  assertions');
+  for (const [name, passed] of checks) console.log(`    ${passed ? 'PASS' : 'FAIL'}  ${name}`);
+  for (const failure of failures.slice(0, 3)) console.error(`    request error at ${failure.base}: ${failure.error}`);
+  console.log('');
+  if (checks.some(([, passed]) => !passed)) process.exitCode = 1;
 }
 
-const jobs = [
-  ...Array.from({ length: USERS }, (_, i) => () => purchase(`shopper-${i}@example.com`)),
-  // The same user hammering Buy Now. Exactly one of these may win.
-  ...Array.from({ length: DUPLICATES }, () => () => purchase('repeat-offender@example.com')),
-];
-
-// Shuffle so the duplicate cohort is interleaved with everyone else rather
-// than arriving as a tidy block at the end.
-for (let i = jobs.length - 1; i > 0; i--) {
-  const j = Math.floor(Math.random() * (i + 1));
-  [jobs[i], jobs[j]] = [jobs[j], jobs[i]];
-}
-
-const startedAt = performance.now();
-const results = await runPool(jobs, CONCURRENCY);
-const wallMs = performance.now() - startedAt;
-
-const counts = results.reduce((acc, r) => ({ ...acc, [r.outcome]: (acc[r.outcome] ?? 0) + 1 }), {});
-const latencies = results.map((r) => r.ms).sort((a, b) => a - b);
-const winners = results.filter((r) => r.outcome === 'purchased').map((r) => r.userId);
-const uniqueWinners = new Set(winners);
-
-console.log('  outcomes');
-for (const [outcome, count] of Object.entries(counts).sort((a, b) => b[1] - a[1])) {
-  console.log(`    ${outcome.padEnd(20)} ${count}`);
-}
-
-console.log(
-  `\n  throughput    ${(results.length / (wallMs / 1000)).toFixed(0)} req/s over ${(wallMs / 1000).toFixed(2)}s\n` +
-    `  latency       p50 ${percentile(latencies, 0.5).toFixed(1)}ms` +
-    `  p95 ${percentile(latencies, 0.95).toFixed(1)}ms` +
-    `  p99 ${percentile(latencies, 0.99).toFixed(1)}ms` +
-    `  max ${latencies.at(-1).toFixed(1)}ms\n`,
-);
-
-const checks = [
-  {
-    name: `exactly ${sale.totalStock} units sold (no oversell, no undersell)`,
-    pass: winners.length === sale.totalStock,
-    detail: `sold ${winners.length}`,
-  },
-  {
-    name: 'every winner is a distinct user',
-    pass: uniqueWinners.size === winners.length,
-    detail: `${uniqueWinners.size} unique of ${winners.length}`,
-  },
-  {
-    name: 'no request failed at the transport layer',
-    pass: (counts.network_error ?? 0) + (counts.error ?? 0) === 0,
-    detail: `${(counts.network_error ?? 0) + (counts.error ?? 0)} failures`,
-  },
-  {
-    name: 'stock reads zero afterwards',
-    pass: (await fetch(`${BASE}/api/sale`).then((r) => r.json())).remainingStock === 0,
-    detail: 'checked via GET /api/sale',
-  },
-];
-
-console.log('  assertions');
-for (const check of checks) {
-  console.log(`    ${check.pass ? 'PASS' : 'FAIL'}  ${check.name}  (${check.detail})`);
-}
-console.log('');
-
-process.exit(checks.every((c) => c.pass) ? 0 : 1);
-
-/**
- * TODO (GUIDE.md step 7):
- *   - Port this to k6 (stress/purchase.k6.js) for a proper ramping profile and
- *     threshold-based pass/fail: `k6 run --vus 2000 --duration 30s`.
- *   - Add a soak variant that keeps polling GET /api/sale during the burst, so
- *     you can show read traffic does not starve writes.
- *   - Run the same script against two API instances behind a load balancer to
- *     prove the Redis driver holds the invariants the memory driver cannot.
- */
+main().catch((error) => {
+  console.error(`\n  FAIL: ${error.message}\n`);
+  process.exitCode = 1;
+});

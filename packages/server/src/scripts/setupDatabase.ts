@@ -3,16 +3,6 @@ import pg from 'pg';
 import { loadConfig } from '../config.ts';
 
 const { Pool } = pg;
-
-interface SaleRow {
-  id: number;
-  product_id: string;
-  remaining_stock: number;
-  total_stock: number;
-  starts_at: Date;
-  ends_at: Date;
-}
-
 const config = loadConfig();
 
 const pool = new Pool({
@@ -27,13 +17,11 @@ pool.on('error', (error) => {
 });
 
 try {
-  // Create the tables and constraints.
   const schemaUrl = new URL('../../db/schema.sql', import.meta.url);
   const schemaSql = await readFile(schemaUrl, 'utf8');
 
   await pool.query(schemaSql);
 
-  // Create the sale only if it does not already exist.
   const inserted = await pool.query(
     `
       INSERT INTO sales (
@@ -49,7 +37,7 @@ try {
       RETURNING id
     `,
     [
-      1,
+      config.saleId,
       config.product.id,
       config.totalStock,
       config.startsAt,
@@ -57,8 +45,7 @@ try {
     ],
   );
 
-  // Read the saved sale, including settings from any earlier run.
-  const result = await pool.query<SaleRow>(
+  const result = await pool.query(
     `
       SELECT
         id,
@@ -70,17 +57,19 @@ try {
       FROM sales
       WHERE id = $1
     `,
-    [1],
+    [config.saleId],
   );
 
   if (!result.rows[0]) {
-    throw new Error('Sale 1 was not found after setup.');
+    throw new Error(
+      `Sale ${config.saleId} was not found after setup.`,
+    );
   }
 
   console.log(
     inserted.rowCount === 1
-      ? 'Created sale 1.'
-      : 'Sale 1 already exists; kept its saved settings.',
+      ? `Created sale ${config.saleId}.`
+      : `Sale ${config.saleId} already exists; kept its saved settings.`,
   );
 
   console.table(result.rows);

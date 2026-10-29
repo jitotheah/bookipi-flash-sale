@@ -2,8 +2,10 @@ import { loadConfig } from '../config.ts';
 import { PostgresInventoryStore } from '../store/postgresStore.ts';
 
 const config = loadConfig();
-const store = new PostgresInventoryStore(config.databaseUrl);
-
+const store = new PostgresInventoryStore(
+  config.databaseUrl,
+  config.saleId,
+);
 try {
   await store.init(config.totalStock);
   console.log('Database initialisation: OK');

@@ -12,7 +12,10 @@ export { RedisInventoryStore } from './redisStore.ts';
 export function createInventoryStore(config: SaleConfig): InventoryStore {
   switch (config.inventoryDriver) {
     case 'postgres':
-      return new PostgresInventoryStore(config.databaseUrl);
+      return new PostgresInventoryStore(
+        config.databaseUrl,
+        config.saleId,
+      );
     case 'redis':
       return new RedisInventoryStore(config.redisUrl, config.product.id);
     case 'memory':
