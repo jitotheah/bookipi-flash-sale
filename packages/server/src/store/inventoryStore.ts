@@ -1,16 +1,11 @@
 import type { Order } from '@flash/shared';
 
 export type ReservationResult =
-  /** This call took one of the units. */
   | { status: 'reserved'; order: Order; remaining: number }
-  /** Sale has not started yet. */
-  | { status: 'sale_not_started'; order: Order }
-    /** Sale has ended. */
-  | { status: 'sale_ended'; order: Order }
-    /** This user already holds a unit -- return the original order, do not charge again. */
   | { status: 'duplicate'; order: Order }
-  /** Stock hit zero before this call arrived. */
-  | { status: 'sold_out' };
+  | { status: 'sold_out' }
+  | { status: 'sale_not_started' }
+  | { status: 'sale_ended' };
 
 /**
  * The concurrency boundary of the whole system.

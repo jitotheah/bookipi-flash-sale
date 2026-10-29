@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../src/app.ts';
 import { MemoryInventoryStore } from '../src/store/memoryStore.ts';
-import { PostgresInventoryStore } from '../src/store/postgresStore.ts';
+import { RedisInventoryStore } from '../src/store/redisStore.ts';
 import { testConfig } from './helpers.ts';
 
 let app: FastifyInstance;
@@ -91,14 +91,14 @@ describe('API', () => {
 describe('unimplemented drivers', () => {
   it('boots and answers 501 rather than crashing or faking a result', async () => {
     app = await buildApp({
-      config: testConfig({ inventoryDriver: 'postgres' }),
-      store: new PostgresInventoryStore('postgres://unused'),
+      config: testConfig({ inventoryDriver: 'redis' }),
+      store: new RedisInventoryStore('redis://unused'),
     });
 
     const sale = await app.inject({ method: 'GET', url: '/api/sale' });
     expect(sale.statusCode).toBe(501);
     expect(sale.json()).toMatchObject({ outcome: 'not_implemented' });
-    expect(sale.json().message).toContain('GUIDE.md step 4');
+    expect(sale.json().message).toContain('RedisInventoryStore');
 
     const purchase = await app.inject({
       method: 'POST',

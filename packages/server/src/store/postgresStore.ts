@@ -1,129 +1,250 @@
+import pg from 'pg';
 import type { Order } from '@flash/shared';
-import { NotImplementedError } from '../errors.ts';
-import type { InventoryStore, ReservationResult } from './inventoryStore.ts';
+import type {
+  InventoryStore,
+  ReservationResult,
+} from './inventoryStore.ts';
 
-/**
- * ============================================================================
- *  GUIDE.md step 4 -- the recommended implementation path. Write it yourself.
- * ============================================================================
- *
- * Schema lives in `packages/server/db/schema.sql` (proposed, not yet applied).
- *
- * ---------------------------------------------------------------------------
- *  THE FOUR TRANSACTION REQUIREMENTS
- *  Every one of these must hold under concurrent load. They are the acceptance
- *  criteria for this file, and the test checklist in the README mirrors them.
- * ---------------------------------------------------------------------------
- *
- *  R1. THE SALE WINDOW IS ENFORCED ON THE SERVER.
- *      A purchase outside [starts_at, ends_at) must be refused regardless of
- *      what the client believes. Put the check in the SQL predicate, using
- *      clock_timestamp() rather than now(): now() is transaction-START time,
- *      and this statement may have spent time blocked on the row lock.
- *      Checking it in SQL also judges the window by ONE clock however many API
- *      nodes exist -- strictly better than the per-node check the skeleton
- *      currently does in flashSale.ts.
- *
- *  R2. STOCK CAN NEVER GO NEGATIVE.
- *      Two defences, both required. The predicate `remaining_stock > 0` in the
- *      UPDATE, and `CHECK (remaining_stock >= 0)` on the column. The predicate
- *      is the mechanism; the CHECK is the proof that a future bug cannot
- *      quietly oversell.
- *
- *  R3. ONE PURCHASE PER USER, ENFORCED BY THE DATABASE.
- *      UNIQUE (sale_id, user_id) on `purchases`. Not a uniqueness check in
- *      application code -- a constraint, so it holds even if the reservation
- *      logic has a race.
- *
- *  R4. A FAILED OR DUPLICATE PURCHASE MUST NEVER CONSUME STOCK.
- *      This is the one most often got wrong. If the INSERT reports a duplicate,
- *      you must NOT run the decrement: return early and ROLLBACK. If the
- *      decrement reports zero rows, the INSERT must not survive. Either both
- *      effects happen or neither does -- that is what the transaction is for.
- *
- * ---------------------------------------------------------------------------
- *  THE TRANSACTION
- * ---------------------------------------------------------------------------
- *
- *   BEGIN;
- *
- *   -- ON CONFLICT rather than catching 23505: a unique violation aborts the
- *   -- WHOLE transaction, so you could not then look up the original order to
- *   -- return it. Zero rows here means "already bought", transaction still
- *   -- alive -- and per R4 you must stop here, before the decrement.
- *   INSERT INTO purchases (order_id, sale_id, user_id)
- *   VALUES ($1, $2, $3)
- *   ON CONFLICT (sale_id, user_id) DO NOTHING
- *   RETURNING order_id, created_at;
- *
- *   -- Only if the INSERT returned a row. Inserting BEFORE this contended
- *   -- UPDATE is deliberate: it shortens the time this transaction holds the
- *   -- exclusive lock on the single `sales` row, which every buyer queues on.
- *   UPDATE sales
- *      SET remaining_stock = remaining_stock - 1
- *    WHERE id = $2
- *      AND remaining_stock > 0
- *      AND clock_timestamp() >= starts_at
- *      AND clock_timestamp() <  ends_at
- *   RETURNING remaining_stock;
- *
- *   COMMIT;   -- or ROLLBACK if either step came back empty
- *
- * Why that UPDATE cannot oversell, which is the part worth being able to
- * explain out loud: under READ COMMITTED a blocked UPDATE re-evaluates its
- * WHERE clause against the row version written by the transaction it waited
- * for (EvalPlanQual). So `remaining_stock > 0` is tested AFTER the wait, not
- * before. Under REPEATABLE READ or SERIALIZABLE the same statement raises a
- * 40001 serialization failure instead and you need a bounded retry loop --
- * know which isolation level your driver opens transactions with.
- *
- * ---------------------------------------------------------------------------
- *  THEN THE PARTS A REVIEWER WILL PROBE
- * ---------------------------------------------------------------------------
- *
- *   1. A zero-row UPDATE cannot tell you WHY it failed. Sold out, not started
- *      and already ended are three different screens in the UI, so classify
- *      with a SELECT on the sales row before you roll back. Collapsing all
- *      three into one "unavailable" is the most common hole in this design,
- *      and `ReservationResult` is typed to stop you doing it.
- *   2. The bottleneck is the connection pool, not the row lock. Thousands of
- *      concurrent buyers against a pool of tens means requests queue inside
- *      the API: latency climbs, timeouts cascade, and the API falls over while
- *      Postgres sits there healthy. Keep transactions short, set lock_timeout
- *      and statement_timeout so waiters fail fast, and put PgBouncer
- *      (transaction mode) in front.
- *   3. Short-circuit the losers. Once stock is zero, a cached flag lets the
- *      other 99% of requests be answered without opening a transaction at all.
- *      The cheapest large win available to this driver.
- *   4. `init` must not refill the shelf on a deploy mid-sale: seed with
- *      INSERT ... ON CONFLICT (id) DO NOTHING, as schema.sql does.
- *   5. If the database is unreachable: FAIL CLOSED. 503, no sale, client
- *      retries. Never fall back to the memory driver -- that is how you
- *      oversell during an incident.
- */
+const { Pool } = pg;
+
+interface PurchaseRow {
+  order_id: string;
+  user_id: string;
+  created_at: Date;
+}
+
 export class PostgresInventoryStore implements InventoryStore {
+  readonly #pool: pg.Pool;
+
   constructor(
-    private readonly databaseUrl: string,
+    databaseUrl: string,
     private readonly saleId = 1,
-  ) {}
+  ) {
+    this.#pool = new Pool({
+      connectionString: databaseUrl,
+      max: 10,
+      connectionTimeoutMillis: 5_000,
+    });
+
+    this.#pool.on('error', (error) => {
+      console.error('Unexpected PostgreSQL connection error:', error.message);
+    });
+  }
 
   async init(_totalStock: number): Promise<void> {
-    throw new NotImplementedError('PostgresInventoryStore.init()', 'step 4');
-  }
+    const result = await this.#pool.query<{ id: number }>(
+      'SELECT id FROM sales WHERE id = $1',
+      [this.saleId],
+    );
 
-  async reserve(_userId: string, _orderId: string, _at: Date): Promise<ReservationResult> {
-    throw new NotImplementedError('PostgresInventoryStore.reserve()', 'step 4');
-  }
-
-  async findOrder(_userId: string): Promise<Order | null> {
-    throw new NotImplementedError('PostgresInventoryStore.findOrder()', 'step 4');
+    if (!result.rows[0]) {
+      throw new Error(
+        'Sale not found. Run npm run db:setup --workspace=@flash/server first.',
+      );
+    }
   }
 
   async remaining(): Promise<number> {
-    throw new NotImplementedError('PostgresInventoryStore.remaining()', 'step 4');
+    const result = await this.#pool.query<{
+      remaining_stock: number;
+    }>(
+      'SELECT remaining_stock FROM sales WHERE id = $1',
+      [this.saleId],
+    );
+
+    const sale = result.rows[0];
+
+    if (!sale) {
+      throw new Error('Cannot read inventory: sale not found.');
+    }
+
+    return sale.remaining_stock;
   }
 
+  async findOrder(userId: string): Promise<Order | null> {
+    const result = await this.#pool.query<PurchaseRow>(
+      `
+        SELECT order_id, user_id, created_at
+        FROM purchases
+        WHERE sale_id = $1 AND user_id = $2
+      `,
+      [this.saleId, userId],
+    );
+
+    const purchase = result.rows[0];
+
+    if (!purchase) {
+      return null;
+    }
+
+    return {
+      orderId: purchase.order_id,
+      userId: purchase.user_id,
+      createdAt: purchase.created_at.toISOString(),
+    };
+  }
+
+  async reserve(
+  userId: string,
+  orderId: string,
+  _at: Date,
+): Promise<ReservationResult> {
+  const client = await this.#pool.connect();
+
+  let discardConnection = false;
+
+  const markConnectionBroken = () => {
+    discardConnection = true;
+  };
+
+  client.on('error', markConnectionBroken);
+
+  try {
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+
+    await client.query("SET LOCAL lock_timeout = '3s'");
+    await client.query("SET LOCAL statement_timeout = '5s'");
+
+    // Lock this sale before performing any purchase writes.
+    const locked = await client.query<{ id: number }>(
+      'SELECT id FROM sales WHERE id = $1 FOR UPDATE',
+      [this.saleId],
+    );
+
+    if (!locked.rows[0]) {
+      throw new Error('Cannot reserve inventory: sale not found.');
+    }
+
+    // Try creating an order. An existing buyer produces no inserted row.
+    const inserted = await client.query<PurchaseRow>(
+      `
+        INSERT INTO purchases (order_id, sale_id, user_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (sale_id, user_id) DO NOTHING
+        RETURNING order_id, user_id, created_at
+      `,
+      [orderId, this.saleId, userId],
+    );
+
+    const newOrder = inserted.rows[0];
+
+    if (!newOrder) {
+      const existing = await client.query<PurchaseRow>(
+        `
+          SELECT order_id, user_id, created_at
+          FROM purchases
+          WHERE sale_id = $1 AND user_id = $2
+        `,
+        [this.saleId, userId],
+      );
+
+      const order = existing.rows[0];
+
+      if (!order) {
+        throw new Error('Duplicate purchase detected, but order was not found.');
+      }
+
+      await client.query('ROLLBACK');
+
+      return {
+        status: 'duplicate',
+        order: {
+          orderId: order.order_id,
+          userId: order.user_id,
+          createdAt: order.created_at.toISOString(),
+        },
+      };
+    }
+
+    // Make one allocation decision using a fresh database timestamp.
+    const allocation = await client.query<{
+      status:
+        | 'reserved'
+        | 'sold_out'
+        | 'sale_not_started'
+        | 'sale_ended';
+      remaining_stock: number | null;
+    }>(
+      `
+        WITH instant AS MATERIALIZED (
+          SELECT clock_timestamp() AS checked_at
+        ),
+        decision AS MATERIALIZED (
+          SELECT
+            CASE
+              WHEN instant.checked_at < sales.starts_at
+                THEN 'sale_not_started'
+              WHEN instant.checked_at >= sales.ends_at
+                THEN 'sale_ended'
+              WHEN sales.remaining_stock <= 0
+                THEN 'sold_out'
+              ELSE 'reserved'
+            END AS status
+          FROM sales
+          CROSS JOIN instant
+          WHERE sales.id = $1
+        ),
+        allocated AS (
+          UPDATE sales AS s
+          SET remaining_stock = s.remaining_stock - 1
+          FROM decision AS d
+          WHERE s.id = $1
+            AND d.status = 'reserved'
+            AND s.remaining_stock > 0
+          RETURNING s.remaining_stock
+        )
+        SELECT decision.status, allocated.remaining_stock
+        FROM decision
+        LEFT JOIN allocated ON true
+      `,
+      [this.saleId],
+    );
+
+    const decision = allocation.rows[0];
+
+    if (!decision) {
+      throw new Error('Inventory allocation returned no decision.');
+    }
+
+    if (decision.status !== 'reserved') {
+      // This also removes the purchase row inserted above.
+      await client.query('ROLLBACK');
+
+      return { status: decision.status };
+    }
+
+    const remaining = decision.remaining_stock;
+
+    if (remaining === null) {
+      throw new Error('Reservation was approved without allocating stock.');
+    }
+
+    await client.query('COMMIT');
+
+    return {
+      status: 'reserved',
+      order: {
+        orderId: newOrder.order_id,
+        userId: newOrder.user_id,
+        createdAt: newOrder.created_at.toISOString(),
+      },
+      remaining,
+    };
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      discardConnection = true;
+    }
+
+    throw error;
+  } finally {
+    client.removeListener('error', markConnectionBroken);
+    client.release(discardConnection);
+  }
+}
+
   async close(): Promise<void> {
-    /* end the pg Pool here once you add it */
+    await this.#pool.end();
   }
 }
