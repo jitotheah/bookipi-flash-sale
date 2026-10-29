@@ -5,7 +5,10 @@ import Fastify, {
   type FastifyServerOptions,
 } from 'fastify';
 import type { SaleConfig } from './config.ts';
-import { NotImplementedError } from './errors.ts';
+import {
+  NotImplementedError,
+  isTemporaryDatabaseError,
+} from './errors.ts';
 import { FlashSaleService } from './domain/flashSale.ts';
 import type { OrderSink } from './persistence/orderSink.ts';
 import { registerPurchaseRoutes } from './routes/purchase.ts';
@@ -61,23 +64,56 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     reply.code(404).send({ outcome: 'error', message: 'Not found' }),
   );
 
-  // Fail closed. A purchase that errored is a purchase the server did not
-  // commit, so the client is safe to retry -- which is only true because
-  // reserve() is atomic and keyed by user.
+  // A connection failure may happen after a purchase was committed.
+  // Clients can check their order or retry using the same user ID.
   app.setErrorHandler(async (error: FastifyError, request, reply) => {
-    const status = error.statusCode && error.statusCode >= 400 ? error.statusCode : 500;
+    const status =
+      error.statusCode &&
+        error.statusCode >= 400 &&
+        error.statusCode < 600
+        ? error.statusCode
+        : 500;
 
-    // 501 is not a failure, it is an honest "not written yet". Pass the real
-    // message through so the UI can say which step is missing.
     if (status === 501) {
       request.log.warn({ err: error }, 'unimplemented operation called');
-      return reply.code(501).send({ outcome: 'not_implemented', message: error.message });
+
+      return reply.code(501).send({
+        outcome: 'not_implemented',
+        message: error.message,
+      });
+    }
+
+    const isPurchase =
+      request.method === 'POST' &&
+      request.routeOptions.url === '/api/purchase';
+
+    const purchaseMessage =
+      'We could not confirm your purchase. Check your order or retry using the same user ID.';
+
+    if (isTemporaryDatabaseError(error) || status === 503) {
+      request.log.warn({ err: error }, 'temporary database failure');
+
+      return reply
+        .header('Retry-After', '1')
+        .code(503)
+        .send({
+          outcome: 'error',
+          message: isPurchase
+            ? purchaseMessage
+            : 'The service is temporarily unavailable. Please try again shortly.',
+        });
     }
 
     request.log.error({ err: error }, 'request failed');
+
     return reply.code(status).send({
       outcome: 'error',
-      message: status >= 500 ? 'The service is busy. Please retry.' : error.message,
+      message:
+        status >= 500
+          ? isPurchase
+            ? purchaseMessage
+            : 'An unexpected error occurred. Please try again later.'
+          : error.message,
     });
   });
 

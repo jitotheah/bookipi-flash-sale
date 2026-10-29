@@ -13,3 +13,56 @@ export class NotImplementedError extends Error {
     this.name = 'NotImplementedError';
   }
 }
+
+const TEMPORARY_DATABASE_CODES = new Set([
+  // Network and connection errors.
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EPIPE',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+
+  // PostgreSQL connection errors.
+  '08000',
+  '08001',
+  '08003',
+  '08004',
+  '08006',
+  '08007',
+
+  // Transaction conflicts, capacity limits, and timeouts.
+  '40001',
+  '40P01',
+  '53300',
+  '55P03',
+  '57014',
+
+  // PostgreSQL shutdown or startup.
+  '57P01',
+  '57P02',
+  '57P03',
+]);
+
+// Some node-postgres connection errors have no error code.
+const CONNECTION_FAILURE_MESSAGES = new Set([
+  'Connection terminated unexpectedly',
+  'Connection terminated due to connection timeout',
+  'timeout exceeded when trying to connect',
+]);
+
+export function isTemporaryDatabaseError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const code = 'code' in error ? error.code : undefined;
+
+  return (
+    (typeof code === 'string' &&
+      TEMPORARY_DATABASE_CODES.has(code)) ||
+    CONNECTION_FAILURE_MESSAGES.has(error.message)
+  );
+}
