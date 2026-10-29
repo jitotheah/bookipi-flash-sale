@@ -148,27 +148,33 @@ export function App() {
     }
   }, [userId, refresh]);
 
-  /** Resolves `uncertain` against the only authoritative answer: the server. */
   const checkMyOrder = useCallback(async () => {
     if (!userId) return;
+
+    setNotice(null);
     setChecking(true);
+
     try {
       const existing = await fetchExistingOrder(userId);
+
       if (existing.hasPurchased && existing.order) {
         setPhase({
           kind: 'result',
           result: {
             outcome: 'already_purchased',
             order: existing.order,
-            message: 'Your order went through after all.',
+            message: 'Your order was confirmed.',
           },
         });
       } else {
-        setNotice('Confirmed: nothing was reserved, so it is safe to try again.');
-        setPhase({ kind: 'browsing' });
+        setNotice(
+          'No order is visible yet. Your earlier request may still be processing. Check again, or retry using the same identifier.',
+        );
       }
     } catch {
-      setNotice('Still cannot reach the service. Try checking again in a moment.');
+      setNotice(
+        'We still cannot check your order. Please try again shortly.',
+      );
     } finally {
       setChecking(false);
     }
@@ -200,7 +206,11 @@ export function App() {
           {phase.kind === 'processing' && <ProcessingCard />}
 
           {phase.kind === 'uncertain' && (
-            <UncertainCard checking={checking} onCheck={checkMyOrder} />
+            <UncertainCard
+              checking={checking}
+              onCheck={checkMyOrder}
+              onRetry={buy}
+            />
           )}
 
           {phase.kind === 'unavailable' && <UnavailableCard message={phase.message} />}
