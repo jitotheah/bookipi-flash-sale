@@ -8,20 +8,14 @@ export type { MockScenario } from './mockApi.ts';
 export type ApiMode = 'mock' | 'live';
 
 /**
- * Which adapter the app talks to.
- *
- * Default is **mock**, because the backend's purchase transaction is still a
- * stub (GUIDE.md step 4) — the UI must be demoable and reviewable before that
- * exists. Switch with `?api=live` in the URL, or VITE_API_MODE=live at build
- * time, once you have a driver that works.
- *
- * Whenever the mock is active the UI shows a labelled banner. Simulated data
- * must never be mistakable for real data.
+ * Uses the live API by default.
+ * Override with ?api=mock for simulated UI previews,
+ * or ?api=live to explicitly select the backend.
  */
 function resolveMode(): ApiMode {
   const override = new URLSearchParams(window.location.search).get('api');
   if (override === 'live' || override === 'mock') return override;
-  return import.meta.env.VITE_API_MODE === 'live' ? 'live' : 'mock';
+  return import.meta.env.VITE_API_MODE === 'mock' ? 'mock' : 'live';
 }
 
 export const API_MODE: ApiMode = resolveMode();
