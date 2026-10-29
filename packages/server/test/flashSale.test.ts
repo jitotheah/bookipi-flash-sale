@@ -12,6 +12,7 @@ async function serviceWith(stock: number, now?: () => Date) {
 }
 
 describe('MemoryInventoryStore', () => {
+  const config = testConfig();
   it('never hands out more units than it holds, however many callers race', async () => {
     const store = new MemoryInventoryStore();
     await store.init(10);
@@ -20,7 +21,12 @@ describe('MemoryInventoryStore', () => {
     // whole design exists to make this assertion hold.
     const results = await Promise.all(
       Array.from({ length: 500 }, (_, i) =>
-        store.reserve(`user-${i}`, `order-${i}`, new Date()),
+        store.reserve(
+          `user-${i}`,
+          `order-${i}`,
+          new Date(),
+          config,
+        )
       ),
     );
 
@@ -35,7 +41,8 @@ describe('MemoryInventoryStore', () => {
     await store.init(10);
 
     const results = await Promise.all(
-      Array.from({ length: 50 }, (_, i) => store.reserve('ada', `order-${i}`, new Date())),
+      Array.from({ length: 50 }, (_, i) => 
+        store.reserve('ada', `order-${i}`, new Date(), config)),
     );
 
     expect(results.filter((r) => r.status === 'reserved')).toHaveLength(1);

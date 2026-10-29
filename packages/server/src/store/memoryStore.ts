@@ -1,6 +1,9 @@
 import type { Order } from '@flash/shared';
-import type { InventoryStore, ReservationResult } from './inventoryStore.ts';
-
+import type {
+  InventoryStore,
+  ReservationResult,
+  SaleWindow,
+} from './inventoryStore.ts';
 /**
  * Single-process inventory. The default driver: zero dependencies, so `npm
  * test` and the demo run with nothing installed.
@@ -23,18 +26,46 @@ export class MemoryInventoryStore implements InventoryStore {
     this.#ordersByUser.clear();
   }
 
-  async reserve(userId: string, orderId: string, at: Date): Promise<ReservationResult> {
-    // --- critical section: no awaits past this line ---
+  async reserve(
+    userId: string,
+    orderId: string,
+    at: Date,
+    configuredWindow: SaleWindow,
+  ): Promise<ReservationResult> {
+    // Keep all checks and writes synchronous.
     const existing = this.#ordersByUser.get(userId);
-    if (existing) return { status: 'duplicate', order: existing };
 
-    if (this.#remaining <= 0) return { status: 'sold_out' };
+    if (existing) {
+      return { status: 'duplicate', order: existing };
+    }
+
+    if (at < configuredWindow.startsAt) {
+      return { status: 'sale_not_started' };
+    }
+
+    if (at >= configuredWindow.endsAt) {
+      return { status: 'sale_ended' };
+    }
+
+    if (this.#remaining <= 0) {
+      return { status: 'sold_out' };
+    }
 
     this.#remaining -= 1;
-    const order: Order = { orderId, userId, createdAt: at.toISOString() };
+
+    const order: Order = {
+      orderId,
+      userId,
+      createdAt: at.toISOString(),
+    };
+
     this.#ordersByUser.set(userId, order);
-    return { status: 'reserved', order, remaining: this.#remaining };
-    // --- end critical section ---
+
+    return {
+      status: 'reserved',
+      order,
+      remaining: this.#remaining,
+    };
   }
 
   async findOrder(userId: string): Promise<Order | null> {

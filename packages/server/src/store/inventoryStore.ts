@@ -1,5 +1,19 @@
 import type { Order } from '@flash/shared';
 
+export interface SaleSnapshot {
+  productId: string;
+  startsAt: Date;
+  endsAt: Date;
+  totalStock: number;
+  remainingStock: number;
+  serverTime: Date;
+}
+
+export interface SaleWindow {
+  startsAt: Date;
+  endsAt: Date;
+}
+
 export type ReservationResult =
   | { status: 'reserved'; order: Order; remaining: number }
   | { status: 'duplicate'; order: Order }
@@ -19,11 +33,19 @@ export type ReservationResult =
  * the same logical request produces the same record rather than a second one.
  */
 export interface InventoryStore {
-  /** Seed stock. Must be safe to call on every boot (idempotent). */
   init(totalStock: number): Promise<void>;
-  reserve(userId: string, orderId: string, at: Date): Promise<ReservationResult>;
+
+  /** Available when the store owns persisted sale settings. */
+  getSale?(): Promise<SaleSnapshot>;
+
+  reserve(
+    userId: string,
+    orderId: string,
+    at: Date,
+    configuredWindow: SaleWindow,
+  ): Promise<ReservationResult>;
+
   findOrder(userId: string): Promise<Order | null>;
-  /** Advisory count for the UI -- never used to decide whether a sale succeeds. */
   remaining(): Promise<number>;
   close(): Promise<void>;
 }

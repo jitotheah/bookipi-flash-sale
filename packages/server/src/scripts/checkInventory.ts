@@ -8,8 +8,16 @@ try {
   await store.init(config.totalStock);
   console.log('Database initialisation: OK');
 
-  const remaining = await store.remaining();
-  console.log('Remaining stock:', remaining);
+  const sale = await store.getSale();
+
+  console.log('Saved sale details:', {
+    productId: sale.productId,
+    startsAt: sale.startsAt.toISOString(),
+    endsAt: sale.endsAt.toISOString(),
+    totalStock: sale.totalStock,
+    remainingStock: sale.remainingStock,
+    databaseTime: sale.serverTime.toISOString(),
+  });
 
   const order = await store.findOrder('ada');
   console.log('Order for ada:', order);

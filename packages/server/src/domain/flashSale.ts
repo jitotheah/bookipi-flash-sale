@@ -6,7 +6,11 @@ import type {
   SaleStatus,
 } from '@flash/shared';
 import type { SaleConfig } from '../config.ts';
-import type { InventoryStore } from '../store/inventoryStore.ts';
+import type {
+  InventoryStore,
+  SaleSnapshot,
+} from '../store/inventoryStore.ts';
+
 import { noopOrderSink, type OrderSink } from '../persistence/orderSink.ts';
 
 const USER_ID_PATTERN = /^[a-z0-9._@+-]{3,64}$/;
@@ -53,16 +57,31 @@ export class FlashSaleService {
   }
 
   async getState(): Promise<SaleStateResponse> {
-    const now = this.#now();
-    const remaining = await this.#store.remaining();
+    const sale: SaleSnapshot = this.#store.getSale
+      ? await this.#store.getSale()
+      : {
+        productId: this.#config.product.id,
+        startsAt: this.#config.startsAt,
+        endsAt: this.#config.endsAt,
+        totalStock: this.#config.totalStock,
+        remainingStock: await this.#store.remaining(),
+        serverTime: this.#now(),
+      };
+
+    if (sale.productId !== this.#config.product.id) {
+      throw new Error(
+        'Stored sale product does not match the configured product.',
+      );
+    }
+
     return {
-      status: this.#statusAt(now, remaining),
+      status: this.#statusAt(sale),
       product: this.#config.product,
-      startsAt: this.#config.startsAt.toISOString(),
-      endsAt: this.#config.endsAt.toISOString(),
-      totalStock: this.#config.totalStock,
-      remainingStock: remaining,
-      serverTime: now.toISOString(),
+      startsAt: sale.startsAt.toISOString(),
+      endsAt: sale.endsAt.toISOString(),
+      totalStock: sale.totalStock,
+      remainingStock: sale.remainingStock,
+      serverTime: sale.serverTime.toISOString(),
     };
   }
 
@@ -76,19 +95,12 @@ export class FlashSaleService {
       };
     }
 
-    // The window is checked before touching the store, so traffic that arrives
-    // outside the sale is rejected without consuming an inventory round trip.
-    // That matters: the minutes before a drop are the heaviest, and none of
-    // those requests can possibly succeed.
-    const now = this.#now();
-    if (now < this.#config.startsAt) {
-      return { outcome: 'sale_not_started', order: null, message: 'The sale has not started yet.' };
-    }
-    if (now >= this.#config.endsAt) {
-      return { outcome: 'sale_ended', order: null, message: 'This sale has ended.' };
-    }
-
-    const result = await this.#store.reserve(userId, randomUUID(), now);
+    const result = await this.#store.reserve(
+      userId,
+      randomUUID(),
+      this.#now(),
+      this.#config,
+    );
 
     switch (result.status) {
       case 'reserved':
@@ -137,9 +149,10 @@ export class FlashSaleService {
     return { userId, hasPurchased: order !== null, order };
   }
 
-  #statusAt(now: Date, remaining: number): SaleStatus {
-    if (now < this.#config.startsAt) return 'upcoming';
-    if (now >= this.#config.endsAt) return 'ended';
-    return remaining > 0 ? 'active' : 'sold_out';
+  #statusAt(sale: SaleSnapshot): SaleStatus {
+    if (sale.serverTime < sale.startsAt) return 'upcoming';
+    if (sale.serverTime >= sale.endsAt) return 'ended';
+
+    return sale.remainingStock > 0 ? 'active' : 'sold_out';
   }
 }

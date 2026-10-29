@@ -3,6 +3,7 @@ import type { Order } from '@flash/shared';
 import type {
   InventoryStore,
   ReservationResult,
+  SaleSnapshot,
 } from './inventoryStore.ts';
 
 const { Pool } = pg;
@@ -42,6 +43,45 @@ export class PostgresInventoryStore implements InventoryStore {
         'Sale not found. Run npm run db:setup --workspace=@flash/server first.',
       );
     }
+  }
+
+    async getSale(): Promise<SaleSnapshot> {
+    const result = await this.#pool.query<{
+      product_id: string;
+      starts_at: Date;
+      ends_at: Date;
+      total_stock: number;
+      remaining_stock: number;
+      server_time: Date;
+    }>(
+      `
+        SELECT
+          product_id,
+          starts_at,
+          ends_at,
+          total_stock,
+          remaining_stock,
+          clock_timestamp() AS server_time
+        FROM sales
+        WHERE id = $1
+      `,
+      [this.saleId],
+    );
+
+    const sale = result.rows[0];
+
+    if (!sale) {
+      throw new Error('Cannot read sale: sale not found.');
+    }
+
+    return {
+      productId: sale.product_id,
+      startsAt: sale.starts_at,
+      endsAt: sale.ends_at,
+      totalStock: sale.total_stock,
+      remainingStock: sale.remaining_stock,
+      serverTime: sale.server_time,
+    };
   }
 
   async remaining(): Promise<number> {
