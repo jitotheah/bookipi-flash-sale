@@ -1,4 +1,9 @@
-# Build guide
+# Original scaffold guide (historical)
+
+> These are the original exercise notes, preserved for reference. References to
+> an unfinished PostgreSQL backend, old test counts, or mock defaults describe
+> the scaffold. For the implemented system and current run/test instructions,
+> use [README.md](./README.md).
 
 One step at a time. Each has a **purpose**, the **files** it touches,
 **acceptance criteria** you can check, and a **verify** command.

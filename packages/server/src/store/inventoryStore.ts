@@ -22,15 +22,17 @@ export type ReservationResult =
   | { status: 'sale_ended' };
 
 /**
- * The concurrency boundary of the whole system.
+ * The concurrency boundary of the system.
  *
- * `reserve` MUST be atomic: the "has this user bought?" check, the "is there
- * stock?" check and the decrement are one indivisible step. Any implementation
- * that performs them as separate round trips will oversell under load -- two
- * requests both read `remaining = 1` and both decrement.
+ * reserve must atomically combine duplicate detection, the sale-window/stock
+ * decision, creation of the order, and the stock decrement. Several SQL
+ * statements are safe when protected by one transaction on the same connection;
+ * an unprotected read followed by a separate write is not.
  *
- * The caller supplies `orderId` so the operation is deterministic: a retry of
- * the same logical request produces the same record rather than a second one.
+ * orderId is a proposed ID for a new order. Retries may propose different UUIDs:
+ * deduplication uses the selected sale and normalized user ID, and returns the
+ * original order. Persisted stores enforce their saved window using their own
+ * authoritative clock; the memory store uses the supplied time and window.
  */
 export interface InventoryStore {
   init(totalStock: number): Promise<void>;

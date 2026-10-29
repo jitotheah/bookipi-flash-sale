@@ -10,8 +10,7 @@ import { ApiNotImplementedError } from './apiError.ts';
  *  MOCK ADAPTER — simulated data, entirely in this browser tab.
  * ============================================================================
  *
- * It exists so the UI can be built and demoed while the backend purchase
- * transaction is still a stub. It is NOT a second implementation of the
+ * It exists so UI states can be previewed independently of the backend. It is NOT a second implementation of the
  * business rules and must never become one: it fakes outcomes so the screens
  * can be seen, it does not prove anything about concurrency. The real
  * invariants are proved by the server's tests.
@@ -19,12 +18,12 @@ import { ApiNotImplementedError } from './apiError.ts';
  * Nothing here is shared between tabs, survives a refresh, or is authoritative.
  * Whenever it is active the UI shows a labelled banner saying so.
  *
- * Scenarios — append `?mock=<name>` to the URL:
+ * Scenarios — append `?api=mock&mock=<name>` to the URL:
  *   active     (default)  an open sale with 10 units
  *   upcoming             starts in two minutes
  *   ended                closed an hour ago
  *   sold_out             open, zero stock
- *   last_one             open, one unit left — race two tabs against it
+ *   last_one             open, one simulated unit left in this tab
  *   slow                 2.5s purchases, to sit in the "purchasing" state
  *   uncertain            purchases fail at the transport layer, outcome unknown
  *   unimplemented        every call answers like a 501 stub driver
@@ -85,7 +84,7 @@ function unimplemented(operation: string): never {
 function status(): SaleStateResponse['status'] {
   const now = Date.now();
   if (now < state.startsAt) return 'upcoming';
-  if (now > state.endsAt) return 'ended';
+  if (now >= state.endsAt) return 'ended';
   return state.remainingStock > 0 ? 'active' : 'sold_out';
 }
 
@@ -133,7 +132,7 @@ export async function attemptPurchase(userId: string): Promise<PurchaseResponse>
   if (now < state.startsAt) {
     return { outcome: 'sale_not_started', order: null, message: 'The sale has not started yet.' };
   }
-  if (now > state.endsAt) {
+  if (now >= state.endsAt) {
     return { outcome: 'sale_ended', order: null, message: 'This sale has ended.' };
   }
   if (state.remainingStock <= 0) {

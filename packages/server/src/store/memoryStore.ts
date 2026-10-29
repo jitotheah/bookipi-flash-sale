@@ -15,7 +15,8 @@ import type {
  * reintroduced the classic oversell bug -- there is a test pinning this.
  *
  * What it cannot do: survive a restart, or stay correct across more than one
- * API process. That is precisely the gap `redisStore` closes.
+ * API process. The PostgreSQL store supplies persistence and coordination
+ * across processes; the Redis store remains an optional stub.
  */
 export class MemoryInventoryStore implements InventoryStore {
   #remaining = 0;

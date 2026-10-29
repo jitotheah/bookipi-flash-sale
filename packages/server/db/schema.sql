@@ -1,11 +1,6 @@
--- =============================================================================
---  Proposed schema for the flash sale. PLANNED, not yet applied by any code --
---  PostgresInventoryStore is a stub (GUIDE.md step 4).
---
---  Apply it by hand while you work:
---    docker compose up -d postgres
---    psql postgres://flash:flash@localhost:5432/flashsale -f packages/server/db/schema.sql
--- =============================================================================
+-- PostgreSQL tables and constraints used by the implemented inventory store.
+-- Apply through: npm run db:setup --workspace=@flash/server
+-- Setup creates the selected sale only if it does not already exist.
 
 CREATE TABLE IF NOT EXISTS sales (
   id              int PRIMARY KEY,

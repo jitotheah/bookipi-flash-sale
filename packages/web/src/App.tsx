@@ -92,15 +92,25 @@ export function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const { sale, offline, unimplemented, skewMs, refresh } = useSaleState();
 
-  const signIn = useCallback(async (id: string) => {
-    localStorage.setItem(USER_KEY, id);
-    setUserId(id);
-    setNotice(null);
+  // A response may arrive after the shopper switches users or starts another
+  // action. Only the latest action for the current user may update this UI.
+  const currentUserRef = useRef(userId);
+  const requestVersionRef = useRef(0);
 
-    // If this user already holds a unit (from an earlier visit, or another
-    // tab), show that straight away instead of letting them press Buy again.
+  const isCurrentRequest = useCallback((version: number, id: string) => (
+    requestVersionRef.current === version && currentUserRef.current === id
+  ), []);
+
+  const restoreOrder = useCallback(async (
+    id: string,
+    version: number,
+    signal?: AbortSignal,
+  ) => {
+
     try {
       const existing = await fetchExistingOrder(id);
+      if (signal?.aborted || !isCurrentRequest(version, id)) return;
+
       if (existing.hasPurchased && existing.order) {
         setPhase({
           kind: 'result',
@@ -110,52 +120,86 @@ export function App() {
             message: 'You already secured one.',
           },
         });
-        return;
       }
     } catch {
-      /* non-fatal: the purchase attempt itself is still authoritative */
+      // A failed lookup does not establish whether an order exists. A purchase
+      // attempt can still recover an existing order using the same identifier.
     }
+    // Do not reset the phase after awaiting: a purchase may already be underway.
+  }, [isCurrentRequest]);
+
+  useEffect(() => {
+    // Restore a remembered user's order after a reload, but never let this
+    // initial check supersede an action the shopper has already started.
+    const controller = new AbortController();
+    const id = currentUserRef.current;
+    if (id && requestVersionRef.current === 0) {
+      void restoreOrder(id, 0, controller.signal);
+    }
+
+    return () => controller.abort();
+  }, [restoreOrder]);
+
+  const signIn = useCallback((id: string) => {
+    const version = ++requestVersionRef.current;
+    localStorage.setItem(USER_KEY, id);
+    currentUserRef.current = id;
+    setUserId(id);
     setPhase({ kind: 'browsing' });
-  }, []);
+    setChecking(false);
+    setNotice(null);
+    void restoreOrder(id, version);
+  }, [restoreOrder]);
 
   const signOut = useCallback(() => {
     localStorage.removeItem(USER_KEY);
+    currentUserRef.current = null;
+    requestVersionRef.current += 1;
     setUserId(null);
     setPhase({ kind: 'browsing' });
+    setChecking(false);
     setNotice(null);
   }, []);
 
   const buy = useCallback(async () => {
-    if (!userId) return;
+    const id = currentUserRef.current;
+    if (!id) return;
+    const version = ++requestVersionRef.current;
+
+    setChecking(false);
     setNotice(null);
     setPhase({ kind: 'processing' });
 
     try {
-      const [result] = await Promise.all([attemptPurchase(userId), wait(MIN_PROCESSING_MS)]);
+      const [result] = await Promise.all([attemptPurchase(id), wait(MIN_PROCESSING_MS)]);
+      if (!isCurrentRequest(version, id)) return;
       setPhase({ kind: 'result', result });
     } catch (error) {
+      if (!isCurrentRequest(version, id)) return;
+
       if (error instanceof ApiNotImplementedError) {
         setPhase({ kind: 'unavailable', message: error.message });
       } else {
-        // We do NOT know whether the server committed before the connection
-        // dropped. Claiming "nothing was reserved" would be a guess, and the
-        // wrong guess either costs the user a unit they own or has them retry
-        // after winning. Resolve it with a read instead.
+        // Ignoring an obsolete UI response does not cancel its transaction.
+        // The original user can recover their order by signing in again.
         setPhase({ kind: 'uncertain' });
       }
     } finally {
-      void refresh();
+      if (isCurrentRequest(version, id)) void refresh();
     }
-  }, [userId, refresh]);
+  }, [isCurrentRequest, refresh]);
 
   const checkMyOrder = useCallback(async () => {
-    if (!userId) return;
+    const id = currentUserRef.current;
+    if (!id) return;
+    const version = ++requestVersionRef.current;
 
     setNotice(null);
     setChecking(true);
 
     try {
-      const existing = await fetchExistingOrder(userId);
+      const existing = await fetchExistingOrder(id);
+      if (!isCurrentRequest(version, id)) return;
 
       if (existing.hasPurchased && existing.order) {
         setPhase({
@@ -172,13 +216,14 @@ export function App() {
         );
       }
     } catch {
+      if (!isCurrentRequest(version, id)) return;
       setNotice(
         'We still cannot check your order. Please try again shortly.',
       );
     } finally {
-      setChecking(false);
+      if (isCurrentRequest(version, id)) setChecking(false);
     }
-  }, [userId]);
+  }, [isCurrentRequest]);
 
   if (!userId) {
     return (

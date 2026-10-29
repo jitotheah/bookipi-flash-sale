@@ -13,8 +13,7 @@ export function MockBanner() {
       <strong>MOCK ADAPTER</strong>
       <span>
         Simulated in this browser tab — no backend, nothing persisted. Scenario:{' '}
-        <code>{MOCK_SCENARIO}</code>. Append <code>?api=live</code> once the Postgres driver is
-        written.
+        <code>{MOCK_SCENARIO}</code>. Use <code>?api=live</code> to connect to the API.
       </span>
     </div>
   );

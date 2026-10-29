@@ -24,9 +24,9 @@ export interface FlashSaleDeps {
 }
 
 /**
- * All business rules live here, with no knowledge of HTTP. The route layer
- * only translates outcomes into status codes, which is why the rules can be
- * unit-tested without a server.
+ * Normalizes identifiers and translates atomic store outcomes into API data,
+ * without knowing HTTP status codes. The store enforces duplicate, time-window
+ * and inventory rules together; the route layer maps outcomes to HTTP codes.
  */
 export class FlashSaleService {
   readonly #store: InventoryStore;
