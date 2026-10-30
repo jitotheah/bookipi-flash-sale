@@ -1,0 +1,32 @@
+-- PostgreSQL tables and constraints used by the implemented inventory store.
+-- Apply through: npm run db:setup --workspace=@flash/server
+-- Setup creates the selected sale only if it does not already exist.
+
+CREATE TABLE IF NOT EXISTS sales (
+  id              int PRIMARY KEY,
+  product_id      text        NOT NULL,
+  -- CHECK is the last line of defence against overselling. If a bug ever lets
+  -- a decrement through at zero, the transaction aborts instead of going
+  -- negative: the database refuses to be wrong even if the code is.
+  remaining_stock int         NOT NULL CHECK (remaining_stock >= 0),
+  total_stock     int         NOT NULL CHECK (total_stock >= 0),
+  starts_at       timestamptz NOT NULL,
+  ends_at         timestamptz NOT NULL,
+  CONSTRAINT sale_window_is_forwards CHECK (ends_at > starts_at)
+);
+
+CREATE TABLE IF NOT EXISTS purchases (
+  order_id   uuid PRIMARY KEY,
+  sale_id    int         NOT NULL REFERENCES sales(id),
+  user_id    text        NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+
+  -- "One item per user", enforced by storage rather than by application logic.
+  -- This is an INDEPENDENT guarantee: it holds even if the reservation code
+  -- has a race, which is exactly what you want from a rule this important.
+  CONSTRAINT one_purchase_per_user UNIQUE (sale_id, user_id)
+);
+
+-- Answers GET /api/purchase/:userId without scanning.
+CREATE INDEX IF NOT EXISTS purchases_user_idx ON purchases (sale_id, user_id);
+

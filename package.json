@@ -1,0 +1,24 @@
+{
+  "name": "bookipi-flash-sale",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "packages/shared",
+    "packages/server",
+    "packages/web"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=@flash/server & npm run dev --workspace=@flash/web",
+    "dev:server": "npm run dev --workspace=@flash/server",
+    "dev:web": "npm run dev --workspace=@flash/web",
+    "test": "npm run test --workspace=@flash/server",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "stress": "node stress/run.mjs",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down"
+  },
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
+  }
+}
